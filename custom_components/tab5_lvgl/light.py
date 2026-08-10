@@ -85,7 +85,7 @@ class Tab5DisplayLight(LightEntity):
     """Display brightness exposed as a light entity."""
 
     _attr_has_entity_name = True
-    _attr_name = "Display Helligkeit"
+    _attr_name = "Display Brightness"
     _attr_icon = "mdi:brightness-6"
     _attr_entity_category = EntityCategory.CONFIG
     _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
@@ -177,7 +177,7 @@ class Tab5ScreensaverBrightnessLight(LightEntity):
     """Screensaver brightness exposed as a percentage-backed light entity."""
 
     _attr_has_entity_name = True
-    _attr_name = "Screensaver Helligkeit"
+    _attr_name = "Screensaver Brightness"
     _attr_icon = "mdi:brightness-4"
     _attr_entity_category = EntityCategory.CONFIG
     _attr_supported_color_modes = {ColorMode.BRIGHTNESS}

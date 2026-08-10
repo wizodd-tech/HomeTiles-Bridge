@@ -29,7 +29,7 @@ async def async_setup_entry(
                 base_topic,
                 TOPIC_SLEEP_MAINS,
                 f"{entry_device_id(entry)}_sleep_mains",
-                "Auto-Sleep Netzteil",
+                "Auto-Sleep Mains",
                 "mdi:power-plug",
             ),
             Tab5SleepSelect(
@@ -37,7 +37,7 @@ async def async_setup_entry(
                 base_topic,
                 TOPIC_SLEEP_BATTERY,
                 f"{entry_device_id(entry)}_sleep_battery",
-                "Auto-Sleep Batterie",
+                "Auto-Sleep Battery",
                 "mdi:battery",
             ),
         ]
