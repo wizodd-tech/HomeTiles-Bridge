@@ -23,6 +23,10 @@
           "base_topic": "MQTT-Basis",
           "ha_prefix": "HA-Praefix"
         }
+      },
+      "discovery_confirm": {
+        "title": "Panel gefunden",
+        "description": "**{name}** hat sich per MQTT mit der Basis {base_topic} gemeldet. Nur hinzuf\u00fcgen, wenn es dein Panel ist."
       }
     },
     "error": {
@@ -60,18 +64,22 @@
       },
       "entities": {
         "title": "Entity-Konfiguration",
-        "description": "Gilt f\u00fcr alle Panels. \u00c4nderungen hier wirken sich auf jedes verbundene Ger\u00e4t aus.",
+        "description": "Gilt f\u00fcr alle Displays. Schaltbare Entit\u00e4ten: Switch, Input Boolean, Automation, Fan, Humidifier, Remote und Siren. Automationen werden aktiviert/deaktiviert. Szenen und Skripte werden gestartet, Buttons und Input Buttons einmal gedr\u00fcckt.",
         "data": {
           "sensors": "Sensoren",
+          "binary_sensors": "Bin\u00e4rsensoren",
           "weathers": "Wetter",
           "lights": "Lichter",
-          "switches": "Schalter",
+          "switches": "Schalter / schaltbare Entit\u00e4ten",
           "media_players": "Media Player",
           "climates": "Klima / Heizung",
           "covers": "Abdeckungen / Rolll\u00e4den",
           "cameras": "Kameras",
-          "scene_entities": "Szenen / Scripts",
-          "scene_map_text": "Szenen- / Script-Alias"
+          "scene_entities": "Szenen / Skripte / Buttons",
+          "scene_map_text": "Aktions-Alias",
+          "numbers": "Zahlenwerte / Zahlenhelfer",
+          "selects": "Auswahl / Auswahlhelfer",
+          "datetimes": "Datum / Uhrzeit / Helfer"
         }
       },
       "energy": {
@@ -85,7 +93,33 @@
       }
     },
     "error": {
-      "invalid_scene_map": "Alias muss dem Muster alias=entity_id folgen (eine Zeile pro Alias)."
+      "invalid_scene_map": "Alias muss dem Muster alias=entity_id folgen (eine Zeile pro Alias).",
+      "invalid_editable_entities": "Bitte passende Zahlen-, Auswahl- oder Datum-/Uhrzeit-Entit\u00e4ten ausw\u00e4hlen."
+    }
+  },
+  "entity": {
+    "camera": {
+      "local_camera": {
+        "name": "Camera"
+      }
+    },
+    "select": {
+      "view": {
+        "name": "View"
+      }
+    },
+    "switch": {
+      "local_camera": {
+        "name": "Camera"
+      }
+    }
+  },
+  "exceptions": {
+    "view_unavailable": {
+      "message": "The display is offline or its view catalog is not ready."
+    },
+    "invalid_view": {
+      "message": "The selected view no longer exists."
     }
   }
 }

@@ -19,8 +19,13 @@ from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import get_url
 
+from .binary_sensor_helpers import split_binary_sensor_entities
+from .control_helpers import ACTION_DOMAINS, SWITCH_DOMAINS, build_action_map, entity_domain
+from .editable_helpers import (EDITABLE_LISTS, EDITABLE_DOMAINS, NUMBER_DOMAINS, SELECT_DOMAINS, DATETIME_DOMAINS, editable_selection, domain_of, build_editable_payload, build_editable_service_call, add_number_history, MAX_CONTROL_BYTES)
 from .const import (
+  CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES,
   CONF_BASE_TOPIC,
+  CONF_BINARY_SENSORS,
   CONF_CAMERAS,
   CONF_CLIMATES,
   CONF_COVERS,
@@ -58,7 +63,7 @@ CONF_PROVISION_MQTT_PASSWORD = "mqtt_password"
 # ---------------------------------------------------------------------------
 
 class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-  VERSION = 1
+  VERSION = 2
 
   # Von async_step_zeroconf zwischengespeichert, bis async_step_zeroconf_confirm
   # abgeschlossen ist (kein persistenter State, nur fuer die Dauer des Flows).
@@ -70,6 +75,8 @@ class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
   _discovered_ha_prefix: Optional[str] = None
   _discovered_mqtt_creds: Optional[Dict[str, Any]] = None
   _discovered_mqtt_error: Optional[str] = None
+  # Panel data announced over MQTT, kept until the user confirms the card.
+  _discovered_data: Optional[Dict[str, Any]] = None
 
   def _validate_topic_input(self, user_input: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Normalisiert base_topic/ha_prefix und prueft auf Kollision. Von async_step_user
@@ -136,12 +143,30 @@ class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
       errors=errors,
     )
 
-  async def async_step_import(self, import_data: Dict[str, Any]):
-    device_id = import_data.get(CONF_DEVICE_ID)
-    if device_id:
-      await self.async_set_unique_id(device_id)
+  async def async_step_integration_discovery(self, discovery_info: Dict[str, Any]):
+    """A panel announced itself over MQTT; ask the user before adding it."""
+    device_id = discovery_info.get(CONF_DEVICE_ID)
+    if not device_id:
+      return self.async_abort(reason="missing_device_id")
+    await self.async_set_unique_id(device_id)
+    self._abort_if_unique_id_configured()
+    self._discovered_data = dict(discovery_info)
+    self.context["title_placeholders"] = {"name": _entry_title(self._discovered_data)}
+    return await self.async_step_discovery_confirm()
+
+  async def async_step_discovery_confirm(self, user_input: Dict[str, Any] | None = None):
+    data = dict(self._discovered_data or {})
+    if user_input is not None:
       self._abort_if_unique_id_configured()
-    return self.async_create_entry(title=_entry_title(import_data), data=import_data)
+      return self.async_create_entry(title=_entry_title(data), data=data)
+    self._set_confirm_only()
+    return self.async_show_form(
+      step_id="discovery_confirm",
+      description_placeholders={
+        "name": _entry_title(data),
+        "base_topic": data.get(CONF_BASE_TOPIC) or "",
+      },
+    )
 
   async def async_step_zeroconf(self, discovery_info: Any):
     """Panel per mDNS gefunden, BEVOR es MQTT-Zugangsdaten hat (siehe Firmware:
@@ -314,7 +339,9 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
         # einem device_id-Wechsel), war die gesamte Auswahl ersatzlos weg.
         # Auf allen Eintraegen spiegeln, wie es async_step_energy schon tut.
         shared_keys = (
-          CONF_SENSORS, CONF_WEATHERS, CONF_LIGHTS, CONF_SWITCHES,
+          "user_sensor_selections",
+          CONF_SENSORS, CONF_BINARY_SENSORS, CONF_WEATHERS, CONF_LIGHTS, CONF_SWITCHES,
+          CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES,
           CONF_CLIMATES, CONF_COVERS,
           CONF_MEDIA_PLAYERS, CONF_CAMERAS, CONF_SCENE_MAP, CONF_SCENE_MAP_TEXT,
         )
@@ -332,7 +359,19 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
       step_id="entities",
       data_schema=vol.Schema({
         vol.Optional(CONF_SENSORS, default=merged.get(CONF_SENSORS, [])): selector.EntitySelector(
-          selector.EntitySelectorConfig(multiple=True)
+          selector.EntitySelectorConfig(domain=["sensor"], multiple=True)
+        ),
+        vol.Optional(CONF_BINARY_SENSORS, default=merged.get(CONF_BINARY_SENSORS, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=["binary_sensor"], multiple=True)
+        ),
+        vol.Optional(CONF_NUMBERS, default=merged.get(CONF_NUMBERS, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=list(NUMBER_DOMAINS), multiple=True)
+        ),
+        vol.Optional(CONF_SELECTS, default=merged.get(CONF_SELECTS, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=list(SELECT_DOMAINS), multiple=True)
+        ),
+        vol.Optional(CONF_DATETIMES, default=merged.get(CONF_DATETIMES, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=list(DATETIME_DOMAINS), multiple=True)
         ),
         vol.Optional(CONF_WEATHERS, default=merged.get(CONF_WEATHERS, [])): selector.EntitySelector(
           selector.EntitySelectorConfig(domain=["weather"], multiple=True)
@@ -341,7 +380,7 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
           selector.EntitySelectorConfig(domain=["light"], multiple=True)
         ),
         vol.Optional(CONF_SWITCHES, default=merged.get(CONF_SWITCHES, [])): selector.EntitySelector(
-          selector.EntitySelectorConfig(domain=["switch"], multiple=True)
+          selector.EntitySelectorConfig(domain=list(SWITCH_DOMAINS), multiple=True)
         ),
         vol.Optional(CONF_MEDIA_PLAYERS, default=merged.get(CONF_MEDIA_PLAYERS, [])): selector.EntitySelector(
           selector.EntitySelectorConfig(domain=["media_player"], multiple=True)
@@ -356,7 +395,7 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
           selector.EntitySelectorConfig(domain=["camera"], multiple=True)
         ),
         vol.Optional(CONF_SCENE_ENTITIES, default=merged.get(CONF_SCENE_ENTITIES, [])): selector.EntitySelector(
-          selector.EntitySelectorConfig(domain=["scene", "script"], multiple=True)
+          selector.EntitySelectorConfig(domain=list(ACTION_DOMAINS), multiple=True)
         ),
         vol.Optional(CONF_SCENE_MAP_TEXT, default=merged.get(CONF_SCENE_MAP_TEXT, "")): selector.TextSelector(
           selector.TextSelectorConfig(multiline=True)
@@ -419,15 +458,27 @@ def _merge_energy_checkboxes(hass, current: Dict[str, Any]) -> Dict[str, Any]:
 
 def _merge_all_entities(hass, current: Dict[str, Any]) -> Dict[str, Any]:
   """Collect entities from all config entries to show the merged state."""
-  current_weather_from_sensors, current_sensors = _split_weather_entities(
+  current_weather_from_sensors, current_legacy_sensors = _split_weather_entities(
     list(current.get(CONF_SENSORS, []))
   )
+  current_binary_from_sensors, current_sensors = split_binary_sensor_entities(
+    current_legacy_sensors
+  )
+  current_binary_sensors, _ = split_binary_sensor_entities(
+    list(current.get(CONF_BINARY_SENSORS, []))
+  )
   all_sensors = list(current_sensors)
+  all_binary_sensors = _unique(
+    current_binary_sensors + current_binary_from_sensors
+  )
   all_weathers = _unique(list(current.get(CONF_WEATHERS, [])) + current_weather_from_sensors)
   all_lights = list(current.get(CONF_LIGHTS, []))
   all_switches = list(current.get(CONF_SWITCHES, []))
   all_media_players = list(current.get(CONF_MEDIA_PLAYERS, []))
   all_climates = list(current.get(CONF_CLIMATES, []))
+  all_numbers = list(current.get(CONF_NUMBERS, []))
+  all_selects = list(current.get(CONF_SELECTS, []))
+  all_datetimes = list(current.get(CONF_DATETIMES, []))
   all_covers = list(current.get(CONF_COVERS, []))
   all_cameras = list(current.get(CONF_CAMERAS, []))
   all_scene_ids = list((current.get(CONF_SCENE_MAP) or {}).values())
@@ -439,25 +490,40 @@ def _merge_all_entities(hass, current: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(entry.data or {})
     if entry.options:
       data.update(entry.options)
-    entry_weather_from_sensors, entry_sensors = _split_weather_entities(list(data.get(CONF_SENSORS, [])))
+    entry_weather_from_sensors, entry_legacy_sensors = _split_weather_entities(list(data.get(CONF_SENSORS, [])))
+    entry_binary_from_sensors, entry_sensors = split_binary_sensor_entities(
+      entry_legacy_sensors
+    )
+    entry_binary_sensors, _ = split_binary_sensor_entities(
+      list(data.get(CONF_BINARY_SENSORS, []))
+    )
     all_sensors.extend(entry_sensors)
+    all_binary_sensors.extend(entry_binary_sensors)
+    all_binary_sensors.extend(entry_binary_from_sensors)
     all_weathers.extend(list(data.get(CONF_WEATHERS, [])))
     all_weathers.extend(entry_weather_from_sensors)
     all_lights.extend(list(data.get(CONF_LIGHTS, [])))
     all_switches.extend(list(data.get(CONF_SWITCHES, [])))
     all_media_players.extend(list(data.get(CONF_MEDIA_PLAYERS, [])))
     all_climates.extend(list(data.get(CONF_CLIMATES, [])))
+    all_numbers.extend(list(data.get(CONF_NUMBERS, [])))
+    all_selects.extend(list(data.get(CONF_SELECTS, [])))
+    all_datetimes.extend(list(data.get(CONF_DATETIMES, [])))
     all_covers.extend(list(data.get(CONF_COVERS, [])))
     all_cameras.extend(list(data.get(CONF_CAMERAS, [])))
     all_scene_ids.extend(list((data.get(CONF_SCENE_MAP) or {}).values()))
 
   return {
     CONF_SENSORS: _unique(all_sensors),
+    CONF_BINARY_SENSORS: _unique(all_binary_sensors),
     CONF_WEATHERS: _unique(all_weathers),
     CONF_LIGHTS: _unique(all_lights),
     CONF_SWITCHES: _unique(all_switches),
     CONF_MEDIA_PLAYERS: _unique(all_media_players),
     CONF_CLIMATES: _unique(all_climates),
+    CONF_NUMBERS: _unique(all_numbers),
+    CONF_SELECTS: _unique(all_selects),
+    CONF_DATETIMES: _unique(all_datetimes),
     CONF_COVERS: _unique(all_covers),
     CONF_CAMERAS: _unique(all_cameras),
     CONF_SCENE_ENTITIES: _unique(all_scene_ids),
@@ -466,7 +532,14 @@ def _merge_all_entities(hass, current: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _convert_entity_data(user_input: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
-  weather_from_sensors, sensors = _split_weather_entities(_normalise_entity_list(user_input.get(CONF_SENSORS, [])))
+  weather_from_sensors, legacy_sensors = _split_weather_entities(
+    _normalise_entity_list(user_input.get(CONF_SENSORS, []))
+  )
+  binary_from_sensors, sensors = split_binary_sensor_entities(legacy_sensors)
+  selected_binary, _ = split_binary_sensor_entities(
+    _normalise_entity_list(user_input.get(CONF_BINARY_SENSORS, []))
+  )
+  binary_sensors = _unique(selected_binary + binary_from_sensors)
   weathers = _unique(
     _normalise_entity_list(user_input.get(CONF_WEATHERS, [])) + weather_from_sensors
   )
@@ -477,33 +550,24 @@ def _convert_entity_data(user_input: Dict[str, Any], current: Dict[str, Any]) ->
   covers = _normalise_entity_list(user_input.get(CONF_COVERS, []))
   cameras = _normalise_entity_list(user_input.get(CONF_CAMERAS, []))
 
-  scene_map = {}
   selected_scenes = _normalise_entity_list(user_input.get(CONF_SCENE_ENTITIES, []))
-  for entity_id in selected_scenes:
-    entity_id = (entity_id or "").strip()
-    if not entity_id:
-      continue
-    alias = entity_id.split(".", 1)[-1].replace("scene.", "").lower()
-    base_alias = alias
-    idx = 2
-    while alias in scene_map:
-      alias = f"{base_alias}{idx}"
-      idx += 1
-    scene_map[alias] = entity_id
-
   scene_map_text = user_input.get(CONF_SCENE_MAP_TEXT, "").strip("\n")
   manual_map = _parse_scene_map(scene_map_text)
-  scene_map.update(manual_map)
+  scene_map = build_action_map(selected_scenes, manual_map, current.get(CONF_SCENE_MAP) or {})
 
   updated = dict(current)
   updated.pop("energy_enabled", None)  # remove old single checkbox
   updated.pop("energy_enabled", None)  # remove old single checkbox
+  updated["user_sensor_selections"] = list(sensors)
   updated[CONF_SENSORS] = sensors
+  updated[CONF_BINARY_SENSORS] = binary_sensors
   updated[CONF_WEATHERS] = weathers
   updated[CONF_LIGHTS] = lights
   updated[CONF_SWITCHES] = switches
   updated[CONF_MEDIA_PLAYERS] = media_players
   updated[CONF_CLIMATES] = climates
+  for key, domains in EDITABLE_LISTS.items():
+    updated[key] = editable_selection(user_input.get(key, current.get(key, [])), domains)
   updated[CONF_COVERS] = covers
   updated[CONF_CAMERAS] = cameras
   updated[CONF_SCENE_MAP] = scene_map
@@ -536,7 +600,7 @@ def _parse_scene_map(text: str) -> Dict[str, str]:
     alias, entity = line.split("=", 1)
     alias = alias.strip().lower()
     entity = entity.strip()
-    if not alias or not entity:
+    if not alias or entity_domain(entity) not in ACTION_DOMAINS:
       raise ValueError("invalid_scene_map")
     mapping[alias] = entity
   return mapping

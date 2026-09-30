@@ -23,6 +23,10 @@
           "base_topic": "MQTT base topic",
           "ha_prefix": "HA entity prefix"
         }
+      },
+      "discovery_confirm": {
+        "title": "Panel discovered",
+        "description": "**{name}** announced itself over MQTT with base topic {base_topic}. Only add it if it is your panel."
       }
     },
     "error": {
@@ -60,18 +64,22 @@
       },
       "entities": {
         "title": "Entity configuration",
-        "description": "Applies to all panels. Changes here affect every connected device.",
+        "description": "Applies to all displays. Switchable entities: switch, input_boolean, automation, fan, humidifier, remote and siren. Automations are enabled/disabled. Scenes and scripts are started; buttons and input buttons are pressed once.",
         "data": {
           "sensors": "Sensors",
+          "binary_sensors": "Binary sensors",
           "weathers": "Weather",
           "lights": "Lights",
-          "switches": "Switches",
+          "switches": "Switches / switchable entities",
           "media_players": "Media players",
           "climates": "Climate devices",
           "covers": "Covers",
           "cameras": "Cameras",
-          "scene_entities": "Scenes / Scripts",
-          "scene_map_text": "Scene / Script aliases"
+          "scene_entities": "Scenes / Scripts / Buttons",
+          "scene_map_text": "Action aliases",
+          "numbers": "Numbers / number helpers",
+          "selects": "Selects / dropdown helpers",
+          "datetimes": "Date / Time / helpers"
         }
       },
       "energy": {
@@ -85,7 +93,33 @@
       }
     },
     "error": {
-      "invalid_scene_map": "Aliases must follow the pattern alias=entity_id (one per line)."
+      "invalid_scene_map": "Aliases must follow the pattern alias=entity_id (one per line).",
+      "invalid_editable_entities": "Choose compatible Number, Select or Date/Time entities."
+    }
+  },
+  "entity": {
+    "camera": {
+      "local_camera": {
+        "name": "Camera"
+      }
+    },
+    "select": {
+      "view": {
+        "name": "View"
+      }
+    },
+    "switch": {
+      "local_camera": {
+        "name": "Camera"
+      }
+    }
+  },
+  "exceptions": {
+    "view_unavailable": {
+      "message": "The display is offline or its view catalog is not ready."
+    },
+    "invalid_view": {
+      "message": "The selected view no longer exists."
     }
   }
 }

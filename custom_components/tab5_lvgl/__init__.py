@@ -9,6 +9,8 @@ from io import BytesIO
 from ipaddress import ip_address
 import json
 import logging
+import secrets
+from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 
 import voluptuous as vol
@@ -16,12 +18,18 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components import mqtt
 from homeassistant.components import network as ha_network
+from homeassistant.components.weather import WeatherEntityFeature
+from homeassistant.components.weather.const import DATA_COMPONENT as WEATHER_DATA_COMPONENT
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.components.recorder import get_instance
 try:
   from homeassistant.components.recorder.history import get_significant_states
 except ImportError:  # pragma: no cover - older HA fallback
   get_significant_states = None
+try:
+  from homeassistant.components.recorder.history import get_last_state_changes
+except ImportError:  # pragma: no cover - older HA fallback
+  get_last_state_changes = None
 try:
   from homeassistant.components.recorder.history import state_changes_during_period
 except ImportError:  # pragma: no cover - older HA fallback
@@ -45,8 +53,10 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import discovery_flow
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.start import async_at_started
 try:
   from homeassistant.helpers.icon import icon_for_entity
 except Exception:  # pragma: no cover - optional fallback
@@ -57,8 +67,49 @@ except Exception:  # pragma: no cover - older HA fallback
   get_url = None
 from homeassistant.util import dt as dt_util, slugify
 
+from .binary_history import (
+  BINARY_HISTORY_KIND,
+  BINARY_HISTORY_RECORDER_MAX_CHANGES,
+  BINARY_HISTORY_RECORDER_PAGE_SIZE,
+  BINARY_HISTORY_RECORDER_RECENT_ROWS,
+  BinaryHistoryRequestError,
+  build_binary_history_error,
+  build_binary_history_response,
+  parse_binary_history_request,
+)
+from .binary_sensor_helpers import (
+  build_binary_sensor_meta_entry,
+  build_binary_sensor_state_payload,
+  migrate_binary_sensor_config,
+  split_binary_sensor_entities,
+)
+from .control_helpers import (
+  ACTION_DOMAINS,
+  SWITCH_DOMAINS,
+  build_action_service_call,
+  build_switch_service_call,
+  build_switch_state_payload,
+  entity_domain,
+  panel_entity_list,
+  resolve_action_entity,
+  resolve_control_entity,
+)
+from .state_history import (
+  STATE_HISTORY_KIND,
+  STATE_HISTORY_MAX_RESPONSE_BYTES,
+  StateHistoryRequestError,
+  build_state_history_error,
+  build_state_history_response,
+  fetch_bounded_state_history,
+  parse_state_history_request,
+  sensor_live_state_payload,
+  sensor_state_kind,
+)
+from .editable_helpers import (EDITABLE_LISTS, EDITABLE_DOMAINS, NUMBER_DOMAINS, SELECT_DOMAINS, DATETIME_DOMAINS, editable_selection, domain_of, build_editable_payload, build_editable_service_call, add_number_history, MAX_CONTROL_BYTES)
 from .const import (
+  CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES,
   CONF_BASE_TOPIC,
+  CONF_BINARY_SENSORS,
   CONF_CAMERAS,
   CONF_CLIMATES,
   CONF_COVERS,
@@ -91,9 +142,14 @@ from .const import (
 )
 from .cover_helpers import (
   build_cover_state_payload,
+  cover_command_supported,
   cover_component_icon,
   normalise_cover_command,
   parse_cover_position,
+)
+from .climate_helpers import (
+  build_climate_service_call,
+  build_climate_state_payload,
 )
 from .camera_stream import (
   CAMERA_BRIDGE_PROTOCOL_VERSION,
@@ -105,6 +161,15 @@ from .camera_stream import (
   CameraStreamManager,
 )
 from .device_helpers import entry_device_id, entry_device_info, entry_device_name
+from .device_registry_helpers import find_entry_device, is_stale_device_entry
+from .capabilities import (
+  CAPABILITIES,
+  merged_capabilities_data,
+  normalise_capabilities,
+  stale_internal_sensor,
+  stale_local_camera,
+)
+from .local_camera import is_local_camera_self_loop
 from .local_io import (
   LOCAL_IO_RELAY,
   LOCAL_IO_TEMPERATURE,
@@ -116,10 +181,16 @@ from .local_io import (
   local_io_unique_id,
   normalise_local_io,
 )
+from .sensor_selection import (
+  clean_stored_sensor_selections,
+  filter_runtime_sensor_entities,
+  runtime_sensor_entity_id_candidates,
+  should_import_feedback_selection,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["light", "select", "switch", "sensor", "binary_sensor"]
+PLATFORMS = ["light", "select", "switch", "sensor", "binary_sensor", "camera"]
 
 MEDIA_COVER_MAX_BYTES = 14000
 # Source covers from HA media_player_proxy can be 200-500 KB (HD album art).
@@ -129,6 +200,8 @@ MEDIA_COVER_MAX_BYTES = 14000
 MEDIA_COVER_FETCH_MAX_BYTES = 1_500_000
 MEDIA_COVER_CACHE_MAX = 24
 MEDIA_COVER_THUMBNAIL_SIZE = 240
+MEDIA_COVER_WARNING_INTERVAL_SECONDS = 15 * 60
+MEDIA_COVER_WARNING_MAX_KEYS = 64
 
 
 def _is_png_payload(data: bytes) -> bool:
@@ -140,7 +213,7 @@ def _resize_media_cover(data: bytes) -> Optional[Tuple[bytes, str]]:
   try:
     from PIL import Image, ImageFile, ImageOps
   except Exception as err:
-    _LOGGER.warning("Tab5 media cover: Pillow not available (%s)", err)
+    _LOGGER.debug("Tab5 media cover: Pillow not available (%s)", err)
     return None
 
   # HA's media_player_proxy occasionally truncates the JPEG by a few bytes
@@ -178,7 +251,7 @@ def _resize_media_cover(data: bytes) -> Optional[Tuple[bytes, str]]:
           return resized, "image/jpeg"
       return resized, "image/jpeg"
   except Exception as err:
-    _LOGGER.warning(
+    _LOGGER.debug(
       "Tab5 media cover: resize failed (%s: %s, %s bytes input)",
       type(err).__name__,
       err,
@@ -244,11 +317,19 @@ SERVICE_SCHEMA = vol.Schema({vol.Optional("entry_id"): cv.string})
 
 FORECAST_DAILY_TYPE = "daily"
 FORECAST_HOURLY_TYPE = "hourly"
+FORECAST_TWICE_DAILY_TYPE = "twice_daily"
+FORECAST_FEATURES = {
+  FORECAST_DAILY_TYPE: WeatherEntityFeature.FORECAST_DAILY,
+  FORECAST_HOURLY_TYPE: WeatherEntityFeature.FORECAST_HOURLY,
+  FORECAST_TWICE_DAILY_TYPE: WeatherEntityFeature.FORECAST_TWICE_DAILY,
+}
 FORECAST_DAILY_LIMIT = 8
 FORECAST_HOURLY_PAYLOAD_LIMIT = 168
 FORECAST_CACHE_TTL = timedelta(minutes=10)
 
-_CONFIG_META_RUNTIME_FIELDS = frozenset({"icon", "state", "value"})
+_CONFIG_META_RUNTIME_FIELDS = frozenset(
+  {"available", "icon", "last_changed", "state", "value"}
+)
 
 
 def _config_signature(config_data: Dict[str, Any]) -> str:
@@ -344,6 +425,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
   if dev_info.get("model"):
     kwargs["model"] = dev_info["model"]
   device_reg.async_get_or_create(**kwargs)
+  for sensor_entry in hass.config_entries.async_entries(DOMAIN):
+    _cleanup_persisted_runtime_sensor_entities(hass, sensor_entry)
   # Der Entry-Titel wird sonst nur einmal bei der Ersterstellung gesetzt und
   # danach nie wieder - anders als der Geraetename oben, der bei jedem Setup
   # frisch berechnet wird. Ohne diesen Abgleich laufen beide Namen auseinander
@@ -353,7 +436,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.config_entries.async_update_entry(entry, title=dev_info["name"])
   _remove_stale_local_io_entities(hass, entry)
   _migrate_local_io_entity_ids(hass, entry)
-  _migrate_internal_sensor_entity_ids(hass, entry)
   bridge = Tab5Bridge(hass, entry)
   await bridge.async_setup()
   hass.data[DOMAIN]["entries"][entry.entry_id] = bridge
@@ -363,60 +445,196 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
   return True
 
 
-def _migrate_internal_sensor_entity_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:
-  """Normalize legacy internal sensor entity IDs to stable IDs.
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+  """Migrate legacy generic sensor selections to dedicated entity lists."""
+  if entry.version > 2:
+    return False
+  if entry.version == 2:
+    return True
 
-  Only runs when there is a single config entry to avoid collisions
-  between multiple devices.
-  """
-  if len(hass.config_entries.async_entries(DOMAIN)) > 1:
-    return
+  data, options, changed = migrate_binary_sensor_config(
+    entry.data,
+    entry.options,
+    sensor_key=CONF_SENSORS,
+    binary_sensor_key=CONF_BINARY_SENSORS,
+  )
+  update: Dict[str, Any] = {"version": 2}
+  if changed:
+    update["data"] = data
+    update["options"] = options
+  hass.config_entries.async_update_entry(entry, **update)
+  _LOGGER.info(
+    "HomeTiles Bridge migrated config entry %s to version 2",
+    entry.entry_id,
+  )
+  return True
+
+
+def _preserved_user_sensor_ids(hass: HomeAssistant, entry: ConfigEntry | None,
+                               incoming_data: Dict[str, Any] | None = None) -> set[str]:
+  """Preserve explicit selections unless their owning panel removes support."""
+  if entry is None:
+    return set()
+  protected = set((entry.data or {}).get("user_sensor_selections", []))
   registry = er.async_get(hass)
-  targets = {
-    "_battery_soc": "sensor.tab5_internal_battery_soc",
-    "_external_temperature": "sensor.tab5_external_temperature",
-  }
+  for owner in hass.config_entries.async_entries(DOMAIN):
+    data = merged_capabilities_data(owner)
+    if owner.entry_id == entry.entry_id and incoming_data:
+      data.update(incoming_data)
+    expected = {local_io_unique_id(entry_device_id(owner), item)
+                for item in data.get(CONF_LOCAL_IO, entry_local_io(owner))}
+    for entity_id in tuple(protected):
+      entity = registry.async_get(entity_id)
+      if (entity is None or entity.platform != DOMAIN or entity.domain != "sensor"
+          or entity.config_entry_id != owner.entry_id):
+        continue
+      unique_id = entity.unique_id or ""
+      obsolete = (unique_id not in expected if "_local_io_" in unique_id
+                  else stale_internal_sensor(unique_id, data))
+      if obsolete:
+        protected.remove(entity_id)
+  return protected
 
-  for reg_entry in list(registry.entities.values()):
-    if reg_entry.config_entry_id != entry.entry_id:
-      continue
-    if reg_entry.domain != "sensor":
-      continue
-    unique_id = (reg_entry.unique_id or "").strip().lower()
-    if not unique_id:
-      continue
 
-    target_entity_id = None
-    for suffix, target in targets.items():
-      if unique_id.endswith(suffix):
-        target_entity_id = target
-        break
+def _runtime_managed_sensor_entity_ids(
+  hass: HomeAssistant,
+  entry: ConfigEntry | None,
+  incoming_data: Dict[str, Any] | None = None,
+) -> set[str]:
+  """Resolve exact sensor IDs that the integration adds at runtime."""
+  registry = er.async_get(hass)
+  protected = _preserved_user_sensor_ids(hass, entry, incoming_data)
+  owned_entity_ids: set[str] = set()
+  device_labels: List[str] = []
+  announced_entity_ids: set[str] = set()
+  local_io_descriptors: List[Dict[str, Any]] = []
 
-    if not target_entity_id:
-      continue
-    if reg_entry.entity_id == target_entity_id:
-      continue
-    if registry.async_get(target_entity_id) is not None:
-      continue
+  if entry is not None:
+    merged = dict(entry.data or {})
+    if entry.options:
+      merged.update(entry.options)
+    device_labels.extend(
+      [
+        entry.title,
+        entry_device_name(entry),
+        merged.get(CONF_DEVICE_NAME),
+        merged.get(CONF_MODEL),
+        merged.get(CONF_DEVICE_ID),
+      ]
+    )
+    local_io_descriptors.extend(entry_local_io(entry))
+    for registry_entry in registry.entities.values():
+      if (
+        registry_entry.config_entry_id == entry.entry_id
+        and registry_entry.domain == "sensor"
+        and registry_entry.platform == DOMAIN
+        and registry_entry.entity_id
+      ):
+        owned_entity_ids.add(registry_entry.entity_id)
 
-    try:
-      registry.async_update_entity(reg_entry.entity_id, new_entity_id=target_entity_id)
-      _LOGGER.info("Tab5 entity migration: %s -> %s", reg_entry.entity_id, target_entity_id)
-    except (ValueError, TypeError) as err:
-      _LOGGER.warning(
-        "Tab5 entity migration failed for %s -> %s: %s",
-        reg_entry.entity_id,
-        target_entity_id,
-        err,
+  if incoming_data is not None:
+    device_labels.extend(
+      [
+        incoming_data.get(CONF_DEVICE_NAME),
+        incoming_data.get(CONF_MODEL),
+        incoming_data.get(CONF_DEVICE_ID),
+      ]
+    )
+    if CONF_LOCAL_IO in incoming_data:
+      local_io_descriptors.extend(
+        normalise_local_io(incoming_data.get(CONF_LOCAL_IO))
       )
+
+  labels = _unique_entities(
+    [str(label).strip() for label in device_labels if str(label or "").strip()]
+  )
+  for descriptor in local_io_descriptors:
+    if descriptor.get("type") != LOCAL_IO_TEMPERATURE:
+      continue
+    if announced_entity_id := local_io_announced_entity_id(descriptor):
+      announced_entity_ids.add(announced_entity_id)
+    announced_entity_ids.update(descriptor.get("legacy_entity_ids", []))
+    sensor_name = str(descriptor.get("name") or "").strip()
+    if sensor_name:
+      object_id = slugify(sensor_name)
+      if object_id:
+        announced_entity_ids.add(f"sensor.{object_id}")
+      for label in labels:
+        object_id = slugify(f"{label} {sensor_name}")
+        if object_id:
+          announced_entity_ids.add(f"sensor.{object_id}")
+
+  candidates = runtime_sensor_entity_id_candidates(
+    labels,
+    owned_entity_ids,
+    announced_entity_ids,
+    slugify,
+  )
+
+  # A historic candidate may since have been claimed by another integration.
+  # Keep that entity selectable unless it still belongs to this config entry.
+  result: set[str] = set()
+  for entity_id in candidates:
+    registry_entry = registry.async_get(entity_id)
+    if entity_id in protected:
+      continue
+    if registry_entry is None:
+      result.add(entity_id)
+      continue
+    if entry is not None and (
+      registry_entry.config_entry_id == entry.entry_id
+      and registry_entry.domain == "sensor"
+      and registry_entry.platform == DOMAIN
+    ):
+      result.add(entity_id)
+  return result
+
+
+def _cleanup_persisted_runtime_sensor_entities(
+  hass: HomeAssistant,
+  entry: ConfigEntry,
+) -> None:
+  """Repair sensor selections affected by the firmware feedback loop."""
+  runtime_entity_ids = set()
+  for owner in hass.config_entries.async_entries(DOMAIN):
+    runtime_entity_ids.update(_runtime_managed_sensor_entity_ids(hass, owner))
+  protected = _preserved_user_sensor_ids(hass, entry)
+  runtime_entity_ids.difference_update(protected)
+  data, options, data_changed, options_changed, removed_count = (
+    clean_stored_sensor_selections(
+      entry.data, entry.options, CONF_SENSORS, runtime_entity_ids
+    )
+  )
+  for storage, is_options in ((data, False), (options, True)):
+    selected = storage.get("user_sensor_selections")
+    if selected is not None:
+      cleaned = [entity_id for entity_id in selected if entity_id in protected]
+      if cleaned != selected:
+        storage["user_sensor_selections"] = cleaned
+        if is_options:
+          options_changed = True
+        else:
+          data_changed = True
+  if not data_changed and not options_changed:
+    return
+
+  update: Dict[str, Any] = {}
+  if data_changed:
+    update["data"] = data
+  if options_changed:
+    update["options"] = options
+  hass.config_entries.async_update_entry(entry, **update)
+  _LOGGER.info(
+    "HomeTiles Bridge removed %s stale runtime sensor selection(s) from %s",
+    removed_count,
+    entry.entry_id,
+  )
 
 
 def _remove_stale_local_io_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
   """Remove registry entries for channels no longer announced by firmware."""
   device_id = entry_device_id(entry)
-  merged = dict(entry.data or {})
-  if entry.options:
-    merged.update(entry.options)
+  merged = merged_capabilities_data(entry)
   local_io_announced = CONF_LOCAL_IO in merged
   legacy_temperature_id = f"{device_id}_external_temperature"
   expected = {
@@ -426,13 +644,22 @@ def _remove_stale_local_io_entities(hass: HomeAssistant, entry: ConfigEntry) -> 
   registry = er.async_get(hass)
   stale: List[str] = []
   for entity in registry.entities.values():
-    if entity.config_entry_id != entry.entry_id:
+    if entity.config_entry_id != entry.entry_id or entity.platform != DOMAIN:
       continue
     unique_id = entity.unique_id or ""
     # Match by the integration-owned delimiter rather than only the current
     # device ID. The fallback adoption path may replace a provisional device
     # ID; entities created under that old ID must not remain as registry orphans.
-    if "_local_io_" in unique_id and unique_id not in expected:
+    if (entity.domain == "sensor" and "_local_io_" not in unique_id
+        and stale_internal_sensor(unique_id, merged)):
+      stale.append(entity.entity_id)
+    elif "_local_io_" in unique_id and unique_id not in expected:
+      stale.append(entity.entity_id)
+    elif (entity.domain in ("camera", "switch") and "_local_io_" not in unique_id
+          and stale_local_camera(unique_id, merged)):
+      # The panel withdrew its own camera (opt-in off, sensor missing or
+      # older firmware); a registry orphan would stay unavailable forever.
+      # The camera's pause switch shares the camera's unique ID suffix.
       stale.append(entity.entity_id)
     elif local_io_announced and (
       unique_id == legacy_temperature_id
@@ -751,6 +978,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
   return unload_ok
 
 
+async def async_remove_config_entry_device(
+  hass: HomeAssistant,
+  config_entry: ConfigEntry,
+  device_entry: dr.DeviceEntry,
+) -> bool:
+  """Allow Home Assistant to remove a stale HomeTiles registry device."""
+  # A manually created entry initially uses its config-entry ID, then adopts
+  # the firmware-announced device ID after the first bridge-config message.
+  # The old registry device is stale; the current identifier must stay owned.
+  return is_stale_device_entry(
+    device_entry.identifiers,
+    (DOMAIN, entry_device_id(config_entry)),
+  )
+
+
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
   """Reload when the config entry is updated."""
   await hass.config_entries.async_reload(entry.entry_id)
@@ -783,19 +1025,35 @@ class Tab5Bridge:
     self.base_topic = _normalise_topic(data.get(CONF_BASE_TOPIC, DEFAULT_BASE), DEFAULT_BASE)
     self.ha_prefix = _normalise_topic(data.get(CONF_HA_PREFIX, DEFAULT_PREFIX), DEFAULT_PREFIX)
     raw_sensors = _unique_entities(list(data.get(CONF_SENSORS, [])))
+    raw_binary_sensors = _unique_entities(
+      list(data.get(CONF_BINARY_SENSORS, []))
+    )
     raw_weathers = _unique_entities(list(data.get(CONF_WEATHERS, [])))
-    legacy_weathers, configured_sensors = _split_weather_entities(raw_sensors)
+    legacy_weathers, legacy_sensors = _split_weather_entities(raw_sensors)
+    legacy_binary_sensors, configured_sensors = split_binary_sensor_entities(
+      legacy_sensors
+    )
+    configured_binary_sensors, _ = split_binary_sensor_entities(
+      raw_binary_sensors
+    )
     self.weathers = _unique_entities(legacy_weathers + raw_weathers)
     self._configured_sensors: List[str] = configured_sensors
     self.sensors: List[str] = []
+    self.binary_sensors: List[str] = _unique_entities(
+      configured_binary_sensors + legacy_binary_sensors
+    )
     self.lights: List[str] = _unique_entities(list(data.get(CONF_LIGHTS, [])))
     self.switches: List[str] = _unique_entities(list(data.get(CONF_SWITCHES, [])))
     self.media_players: List[str] = _unique_entities(list(data.get(CONF_MEDIA_PLAYERS, [])))
     self.climates: List[str] = _unique_entities(list(data.get(CONF_CLIMATES, [])))
+    self.numbers = editable_selection(data.get(CONF_NUMBERS, []), EDITABLE_LISTS["numbers"])
+    self.selects = editable_selection(data.get(CONF_SELECTS, []), EDITABLE_LISTS["selects"])
+    self.datetimes = editable_selection(data.get(CONF_DATETIMES, []), EDITABLE_LISTS["datetimes"])
     self.covers: List[str] = _unique_entities(list(data.get(CONF_COVERS, [])))
     self.cameras: List[str] = _unique_entities(list(data.get(CONF_CAMERAS, [])))
     self.tracked_entities: List[str] = []
     self._media_cover_cache: Dict[str, Dict[str, Any]] = {}
+    self._media_cover_warning_last: Dict[Tuple[str, str], float] = {}
     self._media_publish_generation: Dict[str, int] = {}
     self.scene_map: Dict[str, str] = {
       (alias or "").lower(): entity
@@ -825,6 +1083,9 @@ class Tab5Bridge:
     self._unsub_scene = None
     self._unsub_light = None
     self._unsub_switch = None
+    self._unsub_value = None
+    self._editable_seen = {}
+    self._editable_session = self.hass.data.setdefault(DOMAIN, {}).setdefault("editable_session", secrets.token_hex(16))
     self._unsub_media = None
     self._unsub_climate = None
     self._unsub_cover = None
@@ -841,6 +1102,14 @@ class Tab5Bridge:
     self._icon_cache: Dict[str, str] = {}
     self._icon_refresh_handle = None
     self._forecast_cache: Dict[Tuple[str, str], Tuple[datetime, List[Dict[str, Any]]]] = {}
+    self._weather_subscriptions = {}
+    self._weather_pending = set()
+    self._weather_initial_updates = {}
+    self._weather_update_task = None
+    self._unsub_weather_started = None
+    self._unsub_weather_stop = None
+    self._weather_last_payload: Dict[str, str] = {}
+    self._weather_revision: Dict[str, int] = {}
     self._refresh_runtime_entity_lists()
 
   def _resolve_internal_sensor_entities(self) -> List[str]:
@@ -882,10 +1151,14 @@ class Tab5Bridge:
   def _collect_all_entries_entities(self) -> Dict[str, Any]:
     """Merge entity lists from all config entries in this integration."""
     all_sensors: List[str] = []
+    all_binary_sensors: List[str] = []
     all_lights: List[str] = []
     all_switches: List[str] = []
     all_media_players: List[str] = []
     all_climates: List[str] = []
+    all_numbers: List[str] = []
+    all_selects: List[str] = []
+    all_datetimes: List[str] = []
     all_covers: List[str] = []
     all_cameras: List[str] = []
     all_weathers: List[str] = []
@@ -895,14 +1168,26 @@ class Tab5Bridge:
       if entry.options:
         data.update(entry.options)
       raw_sensors = _unique_entities(list(data.get(CONF_SENSORS, [])))
+      raw_binary_sensors = _unique_entities(
+        list(data.get(CONF_BINARY_SENSORS, []))
+      )
       raw_weathers = _unique_entities(list(data.get(CONF_WEATHERS, [])))
-      legacy_weathers, sensors = _split_weather_entities(raw_sensors)
+      legacy_weathers, legacy_sensors = _split_weather_entities(raw_sensors)
+      legacy_binary_sensors, sensors = split_binary_sensor_entities(
+        legacy_sensors
+      )
+      binary_sensors, _ = split_binary_sensor_entities(raw_binary_sensors)
       weathers = _unique_entities(legacy_weathers + raw_weathers)
       all_sensors.extend(sensors)
+      all_binary_sensors.extend(binary_sensors)
+      all_binary_sensors.extend(legacy_binary_sensors)
       all_lights.extend(list(data.get(CONF_LIGHTS, [])))
       all_switches.extend(list(data.get(CONF_SWITCHES, [])))
       all_media_players.extend(list(data.get(CONF_MEDIA_PLAYERS, [])))
       all_climates.extend(list(data.get(CONF_CLIMATES, [])))
+      all_numbers.extend(editable_selection(data.get(CONF_NUMBERS, []), EDITABLE_LISTS["numbers"]))
+      all_selects.extend(editable_selection(data.get(CONF_SELECTS, []), EDITABLE_LISTS["selects"]))
+      all_datetimes.extend(editable_selection(data.get(CONF_DATETIMES, []), EDITABLE_LISTS["datetimes"]))
       all_covers.extend(list(data.get(CONF_COVERS, [])))
       all_cameras.extend(list(data.get(CONF_CAMERAS, [])))
       all_weathers.extend(weathers)
@@ -911,10 +1196,14 @@ class Tab5Bridge:
           all_scene_map.setdefault((alias or "").lower(), entity)
     return {
       "sensors": _unique_entities(all_sensors),
+      "binary_sensors": _unique_entities(all_binary_sensors),
       "lights": _unique_entities(all_lights),
       "switches": _unique_entities(all_switches),
       "media_players": _unique_entities(all_media_players),
       "climates": _unique_entities(all_climates),
+      "numbers": _unique_entities(all_numbers),
+      "selects": _unique_entities(all_selects),
+      "datetimes": _unique_entities(all_datetimes),
       "covers": _unique_entities(all_covers),
       "cameras": _unique_entities(all_cameras),
       "weathers": _unique_entities(all_weathers),
@@ -934,22 +1223,31 @@ class Tab5Bridge:
     self.sensors = _unique_entities(
       merged["sensors"] + internal_sensors + local_temperatures
     )
+    self.binary_sensors = merged["binary_sensors"]
     self.lights = merged["lights"]
     self.switches = _unique_entities(merged["switches"] + local_relays)
     self.media_players = merged["media_players"]
     self.climates = merged["climates"]
+    self.numbers = merged["numbers"]
+    self.selects = merged["selects"]
+    self.datetimes = merged["datetimes"]
     self.covers = merged["covers"]
     self.cameras = merged["cameras"]
     self.weathers = merged["weathers"]
-    self.scene_map.update(merged["scene_map"])
+    self.scene_map = dict(merged["scene_map"])
     self.tracked_entities = _unique_entities(
       self.sensors
+      + self.binary_sensors
       + self.lights
       + self.switches
       + self.media_players
       + self.climates
+      + self.numbers
+      + self.selects
+      + self.datetimes
       + self.covers
       + self.weathers
+      + list(self.scene_map.values())
     )
     if self._runtime_setup_complete and tuple(self.tracked_entities) != previous_tracked:
       if self._unsub_state:
@@ -961,6 +1259,9 @@ class Tab5Bridge:
           self.tracked_entities,
           self._handle_state_event,
         )
+
+    if self._runtime_setup_complete:
+      self._sync_weather_subscriptions()
 
   async def async_setup(self) -> None:
     """Subscribe to MQTT topics and start observers."""
@@ -993,6 +1294,9 @@ class Tab5Bridge:
       self._async_handle_switch_command,
     )
 
+    self._unsub_value = await mqtt.async_subscribe(
+      self.hass, f"{self.base_topic}/cmnd/value", self._async_handle_value_command,
+    )
     self._unsub_media = await mqtt.async_subscribe(
       self.hass,
       f"{self.base_topic}/cmnd/media",
@@ -1070,10 +1374,15 @@ class Tab5Bridge:
       )
       _LOGGER.debug("Tab5 subscribed to energy topic %s", self.energy_request_topic)
     self._schedule_config_refresh()
+    self._unsub_weather_stop = self.hass.bus.async_listen_once(
+      EVENT_HOMEASSISTANT_STOP, self._async_stop_weather_updates
+    )
+    self._unsub_weather_started = async_at_started(self.hass, self._weather_started)
 
   async def async_unload(self) -> None:
     """Cleanup subscriptions."""
     self._runtime_setup_complete = False
+    await self._async_stop_weather_updates()
     # Release any state-publish ownership so a surviving entry can reclaim it.
     owners = self.hass.data.get(DOMAIN, {}).get("state_owners")
     if owners:
@@ -1097,6 +1406,9 @@ class Tab5Bridge:
     if self._unsub_switch:
       self._unsub_switch()
       self._unsub_switch = None
+    if self._unsub_value:
+      self._unsub_value()
+      self._unsub_value = None
     if self._unsub_media:
       self._unsub_media()
       self._unsub_media = None
@@ -1150,7 +1462,10 @@ class Tab5Bridge:
           "base_topic": self.base_topic,
           "ha_prefix": self.ha_prefix,
           "sensors": self.sensors,
+          "configured_sensors": self._configured_sensors,
           "sensor_meta": self._build_sensor_meta(),
+          CONF_BINARY_SENSORS: self.binary_sensors,
+          "binary_sensor_meta": self._build_binary_sensor_meta(),
           CONF_WEATHERS: self.weathers,
           "weather_meta": self._build_weather_meta(),
           "lights": self.lights,
@@ -1161,8 +1476,12 @@ class Tab5Bridge:
           "media_player_meta": self._build_entity_meta(self.media_players),
           CONF_CLIMATES: self.climates,
           "climate_meta": self._build_entity_meta(self.climates),
+          CONF_NUMBERS: self.numbers,
+          CONF_SELECTS: self.selects,
+          CONF_DATETIMES: self.datetimes,
           CONF_COVERS: self.covers,
           "cover_meta": self._build_entity_meta(self.covers),
+          "editable_meta": self._build_entity_meta(self.numbers + self.selects + self.datetimes),
           CONF_CAMERAS: self.cameras,
           "camera_meta": self._build_entity_meta(self.cameras),
           "scene_meta": self._build_scene_meta(),
@@ -1207,9 +1526,157 @@ class Tab5Bridge:
     """Push all configured entities to MQTT."""
     for entity_id in self.tracked_entities:
       state = self.hass.states.get(entity_id)
+      if entity_id in getattr(self, "numbers", []) + getattr(self, "selects", []) + getattr(self, "datetimes", []) and not state:
+        await self._async_publish_editable_state(entity_id, None)
       if not state:
+        if entity_id in self.binary_sensors:
+          await self._async_publish_binary_sensor_absent_state(entity_id)
+        elif entity_id in self.switches:
+          await self._async_publish_switch_absent_state(entity_id)
         continue
       await self._async_publish_entity_state(entity_id, state)
+
+  def _editable_payload(self, entity_id, state):
+    payload = build_editable_payload(
+      entity_id, state.state if state else None,
+      state.attributes if state else {}, self._editable_session,
+      self.hass.config.time_zone,
+    )
+    changed = getattr(state, "last_changed", None)
+    if isinstance(changed, datetime):
+      payload["last_changed"] = int(changed.timestamp())
+    return payload
+
+  async def _async_publish_editable_state(self, entity_id, state):
+    if not self._owns_state_publish(entity_id):
+      return
+    payload = json.dumps(self._editable_payload(entity_id, state), ensure_ascii=False)
+    if len(payload.encode("utf-8")) > MAX_CONTROL_BYTES:
+      return
+    # An additive topic preserves plain state payloads consumed by old firmware.
+    await mqtt.async_publish(self.hass, self._ha_topic_for_entity(entity_id, "control"),
+                             payload, qos=0, retain=True)
+
+  async def _async_handle_value_command(self, msg):
+    if getattr(msg, "retain", False) or len(msg.payload) > 2048:
+      return
+    command = _try_parse_json(msg.payload)
+    if not isinstance(command, dict):
+      return
+    entity_id = command.get("entity_id")
+    command_id = command.get("id")
+    if (entity_id not in self.numbers + self.selects + self.datetimes or
+        not isinstance(command_id, str) or not 1 <= len(command_id) <= 48):
+      return
+    now = dt_util.utcnow().timestamp()
+    deadline = command.get("deadline")
+    status = "invalid_value"
+    try:
+      if (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or
+          not 0 < deadline - now <= 15 or command.get("session") != self._editable_session):
+        raise ValueError("expired")
+      self._editable_seen = {key: expiry for key, expiry in self._editable_seen.items() if expiry > now}
+      if command_id in self._editable_seen or len(self._editable_seen) >= 128:
+        return
+      self._editable_seen[command_id] = deadline
+      state = self.hass.states.get(entity_id)
+      payload = self._editable_payload(entity_id, state)
+      if command.get("revision") != payload["revision"]:
+        raise ValueError("changed")
+      domain, service, data = build_editable_service_call(
+        entity_id, command.get("value"), payload, self.hass.config.time_zone)
+      await self.hass.services.async_call(domain, service, {"entity_id": entity_id, **data}, blocking=True)
+      status = "ok"
+    except ValueError as error:
+      status = str(error)
+    except Exception:
+      status = "failed"
+      _LOGGER.exception("HomeTiles value command failed for %s", entity_id)
+    await mqtt.async_publish(self.hass, f"{self.base_topic}/stat/value",
+      json.dumps({"entity_id": entity_id, "id": command_id, "status": status}), qos=0, retain=False)
+    await self._async_publish_editable_state(entity_id, self.hass.states.get(entity_id))
+
+  async def _async_handle_editable_history(self, parsed):
+    entity_id = parsed.get("entity_id")
+    if entity_id not in self.numbers + self.selects + self.datetimes:
+      return
+    try:
+      request = parse_state_history_request(parsed)
+    except StateHistoryRequestError:
+      return
+    end = dt_util.utcnow()
+    start = end - timedelta(hours=request.hours)
+    current = self.hass.states.get(entity_id)
+    available, complete, until = False, False, start
+    states = []
+    try:
+      recorder = get_instance(self.hass)
+      recorded = getattr(recorder, "entity_filter", None)
+      available = bool(state_changes_during_period or get_last_state_changes)
+      if callable(recorded):
+        available = available and recorded(entity_id)
+      if available:
+        def fetch():
+          return fetch_bounded_state_history(self.hass, entity_id, start, end,
+            state_changes_during_period=state_changes_during_period,
+            get_last_state_changes=get_last_state_changes,
+            recent_limit=request.max_transitions + 1)
+        states, complete, until = await recorder.async_add_executor_job(fetch)
+    except Exception:
+      available = False
+      _LOGGER.debug("HomeTiles Recorder unavailable for %s", entity_id, exc_info=True)
+    if domain_of(entity_id) in DATETIME_DOMAINS:
+      normalized = []
+      attributes = current.attributes if current else {}
+      for record in states:
+        raw = record.get("state") if isinstance(record, dict) else getattr(record, "state", None)
+        changed = record.get("last_changed", record.get("last_updated")) if isinstance(record, dict) else getattr(record, "last_changed", None)
+        value = build_editable_payload(entity_id, raw, attributes, self._editable_session, self.hass.config.time_zone)
+        normalized.append({"state": value["state"], "last_changed": changed})
+      states = normalized
+      if current is not None:
+        current = {"state": self._editable_payload(entity_id, current)["state"],
+                   "last_changed": getattr(current, "last_changed", None)}
+    response = build_state_history_response(entity_id, states, current, start, end,
+      request.hours, request.max_transitions, history_available=available,
+      history_complete=complete, history_complete_until=until)
+    if domain_of(entity_id) in NUMBER_DOMAINS:
+      response = add_number_history(response, states if available else [], start, end,
+                                   288 if request.hours == 24 else 168,
+                                   complete=complete, complete_until=until)
+      response["unit"] = str((current.attributes if current else {}).get("unit_of_measurement") or "")[:32]
+    response["request_id"] = str(parsed.get("request_id") or "")[:48]
+    encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    if len(encoded.encode("utf-8")) <= STATE_HISTORY_MAX_RESPONSE_BYTES:
+      await mqtt.async_publish(self.hass, self.history_response_topic, encoded, qos=0, retain=False)
+
+  async def _async_publish_binary_sensor_absent_state(
+    self, entity_id: str
+  ) -> None:
+    """Replace a stale retained binary state when HA has no current entity."""
+    if entity_id not in self.binary_sensors or not self._owns_state_publish(entity_id):
+      return
+    await mqtt.async_publish(
+      self.hass,
+      self._ha_topic_for_entity(entity_id, "state"),
+      json.dumps(
+        build_binary_sensor_state_payload(None, {}, None),
+        separators=(",", ":"),
+      ),
+      qos=0,
+      retain=True,
+    )
+
+  async def _async_publish_switch_absent_state(self, entity_id: str) -> None:
+    """Clear retained on/off state after removal, including during startup."""
+    if entity_id not in self.switches or not self._owns_state_publish(entity_id):
+      return
+    await mqtt.async_publish(
+      self.hass, self._ha_topic_for_entity(entity_id, "state"),
+      ("unavailable" if entity_domain(entity_id) == "switch" else
+       json.dumps(build_switch_state_payload(entity_id, None, {}))),
+      qos=0, retain=True,
+    )
 
   async def _async_build_state_payload(
     self,
@@ -1224,7 +1691,7 @@ class Tab5Bridge:
         await self._async_attach_media_cover_data(entity_id, payload)
       payload_text = json.dumps(payload, default=str)
       if include_media_cover:
-        _LOGGER.warning(
+        _LOGGER.debug(
           "Tab5 media state payload for %s: %s chars, cover_data=%s",
           entity_id,
           len(payload_text),
@@ -1257,6 +1724,8 @@ class Tab5Bridge:
     if not self._owns_state_publish(entity_id):
       return
     topic = self._ha_topic_for_entity(entity_id, "state")
+    if entity_id in self.numbers + self.selects + self.datetimes:
+      await self._async_publish_editable_state(entity_id, state)
 
     if entity_id.startswith("media_player."):
       generation = self._media_publish_generation.get(entity_id, 0) + 1
@@ -1286,6 +1755,29 @@ class Tab5Bridge:
     if _is_weather_entity(entity_id):
       await self._async_publish_weather_state(entity_id, state, retain=True)
 
+  def _log_media_cover_warning(
+    self,
+    entity_id: str,
+    reason: str,
+    message: str,
+    *args: Any,
+  ) -> None:
+    """Rate-limit recurring media-cover problems by entity and reason."""
+    now = monotonic()
+    key = (entity_id, reason)
+    last_logged = self._media_cover_warning_last.get(key)
+    if last_logged is not None and now - last_logged < MEDIA_COVER_WARNING_INTERVAL_SECONDS:
+      return
+
+    self._media_cover_warning_last[key] = now
+    if len(self._media_cover_warning_last) > MEDIA_COVER_WARNING_MAX_KEYS:
+      oldest_key = min(
+        self._media_cover_warning_last,
+        key=self._media_cover_warning_last.get,
+      )
+      self._media_cover_warning_last.pop(oldest_key, None)
+    _LOGGER.warning(message, *args)
+
   async def _async_attach_media_cover_data(self, entity_id: str, payload: Dict[str, Any]) -> None:
     url = ""
     # Prefer media_image_url first - it usually points at the upstream CDN
@@ -1298,19 +1790,15 @@ class Tab5Bridge:
         url = value
         break
     if not url:
-      _LOGGER.warning("Tab5 media cover missing URL for %s", entity_id)
+      _LOGGER.debug("Tab5 media cover has no artwork URL for %s", entity_id)
       return
 
-    _LOGGER.warning(
-      "Tab5 media cover fetching for %s: %s",
-      entity_id,
-      url[:120] + ("..." if len(url) > 120 else ""),
-    )
+    _LOGGER.debug("Tab5 media cover fetch started for %s", entity_id)
 
     cached = self._media_cover_cache.get(url)
     if cached:
       payload.update(cached)
-      _LOGGER.warning(
+      _LOGGER.debug(
         "Tab5 media cover cache hit for %s: %s bytes",
         entity_id,
         cached.get("entity_picture_bytes"),
@@ -1321,7 +1809,9 @@ class Tab5Bridge:
       session = async_get_clientsession(self.hass)
       async with session.get(url, timeout=5) as response:
         if response.status != 200:
-          _LOGGER.warning(
+          self._log_media_cover_warning(
+            entity_id,
+            f"http_{response.status}",
             "Tab5 media cover fetch failed for %s: HTTP %s",
             entity_id,
             response.status,
@@ -1343,11 +1833,22 @@ class Tab5Bridge:
             break
         data = b"".join(chunks)
     except Exception as err:  # pragma: no cover - network dependent
-      _LOGGER.warning("Tab5 media cover fetch failed for %s: %s", entity_id, err)
+      self._log_media_cover_warning(
+        entity_id,
+        "network",
+        "Tab5 media cover fetch failed for %s: %s",
+        entity_id,
+        type(err).__name__,
+      )
       return
 
     if len(data) == 0:
-      _LOGGER.warning("Tab5 media cover skipped for %s: empty response", entity_id)
+      self._log_media_cover_warning(
+        entity_id,
+        "empty",
+        "Tab5 media cover skipped for %s: empty response",
+        entity_id,
+      )
       return
 
     # Some upstreams (radio TuneIn covers, etc.) advertise
@@ -1367,7 +1868,7 @@ class Tab5Bridge:
 
     if not content_type or not content_type.startswith("image/"):
       if sniffed_mime:
-        _LOGGER.warning(
+        _LOGGER.debug(
           "Tab5 media cover: %s reported content-type=%s, sniffed %s",
           entity_id,
           content_type or "<none>",
@@ -1375,7 +1876,9 @@ class Tab5Bridge:
         )
         content_type = sniffed_mime
       else:
-        _LOGGER.warning(
+        self._log_media_cover_warning(
+          entity_id,
+          "invalid_type",
           "Tab5 media cover skipped for %s: content-type=%s, magic=%s",
           entity_id,
           content_type or "<none>",
@@ -1388,7 +1891,9 @@ class Tab5Bridge:
       content_type = sniffed_mime
 
     if len(data) > MEDIA_COVER_FETCH_MAX_BYTES:
-      _LOGGER.warning(
+      self._log_media_cover_warning(
+        entity_id,
+        "fetch_too_large",
         "Tab5 media cover skipped for %s: %s bytes > fetch limit %s",
         entity_id,
         len(data),
@@ -1411,14 +1916,18 @@ class Tab5Bridge:
           or _is_png_payload(data)
           or data[:3] == b"\xff\xd8\xff"
         ):
-          _LOGGER.warning(
+          self._log_media_cover_warning(
+            entity_id,
+            "resize_fallback",
             "Tab5 media cover: resize failed for %s, sending original (%s bytes, %s)",
             entity_id,
             len(data),
             content_type or "unknown",
           )
         else:
-          _LOGGER.warning(
+          self._log_media_cover_warning(
+            entity_id,
+            "conversion_failed",
             "Tab5 media cover skipped for %s: %s bytes, type=%s, conversion failed",
             entity_id,
             len(data),
@@ -1427,7 +1936,7 @@ class Tab5Bridge:
           return
       else:
         resized_data, resized_mime = resized
-        _LOGGER.warning(
+        _LOGGER.debug(
           "Tab5 media cover converted for %s: %s %s bytes -> %s %s bytes",
           entity_id,
           content_type or "unknown",
@@ -1439,7 +1948,9 @@ class Tab5Bridge:
         content_type = resized_mime
 
     if len(data) > MEDIA_COVER_MAX_BYTES:
-      _LOGGER.warning(
+      self._log_media_cover_warning(
+        entity_id,
+        "resized_too_large",
         "Tab5 media cover skipped for %s: resized %s bytes > %s",
         entity_id,
         len(data),
@@ -1456,7 +1967,7 @@ class Tab5Bridge:
     while len(self._media_cover_cache) > MEDIA_COVER_CACHE_MAX:
       self._media_cover_cache.pop(next(iter(self._media_cover_cache)))
     payload.update(cover_payload)
-    _LOGGER.warning(
+    _LOGGER.debug(
       "Tab5 media cover attached for %s: %s bytes, base64=%s chars",
       entity_id,
       len(data),
@@ -1486,7 +1997,9 @@ class Tab5Bridge:
       _LOGGER.warning("Tab5 reported an invalid LAN IP: %s", ip)
       return
     device_reg = dr.async_get(self.hass)
-    device = device_reg.async_get_device(identifiers={(DOMAIN, self.device_id)})
+    device = find_entry_device(
+      device_reg, (DOMAIN, self.device_id), self.entry.entry_id
+    )
     if not device:
       return
     url = f"http://{ip}/"
@@ -1505,6 +2018,338 @@ class Tab5Bridge:
     await self.async_publish_config_to_device(force=force)
     await self.async_publish_snapshot()
 
+  async def _async_handle_state_history_request(
+    self, parsed: Dict[str, Any]
+  ) -> None:
+    """Handle bounded history for a configured textual sensor state."""
+    entity_id = str(parsed.get("entity_id") or "").strip()
+
+    async def _publish_error(code: str) -> None:
+      _LOGGER.warning(
+        "HomeTiles state history request failed for %s: %s",
+        entity_id or "<missing>",
+        code,
+      )
+      await mqtt.async_publish(
+        self.hass,
+        self.history_response_topic,
+        json.dumps(
+          build_state_history_error(entity_id, code),
+          separators=(",", ":"),
+        ),
+        qos=0,
+        retain=False,
+      )
+
+    try:
+      request = parse_state_history_request(parsed)
+    except StateHistoryRequestError as err:
+      await _publish_error(err.code)
+      return
+
+    if not entity_id:
+      await _publish_error("missing_entity_id")
+      return
+    if not entity_id.startswith("sensor."):
+      await _publish_error("invalid_entity_id")
+      return
+    if entity_id not in self.sensors:
+      await _publish_error("entity_not_configured")
+      return
+
+    end = dt_util.utcnow()
+    start = end - timedelta(hours=request.hours)
+    current_state = self.hass.states.get(entity_id)
+
+    def _fetch_state_history_states() -> Tuple[List[Any], bool, datetime]:
+      return fetch_bounded_state_history(
+        self.hass,
+        entity_id,
+        start,
+        end,
+        state_changes_during_period=state_changes_during_period,
+        get_last_state_changes=get_last_state_changes,
+        recent_limit=request.max_transitions + 1,
+      )
+
+    history_available = (
+      state_changes_during_period is not None
+      or get_last_state_changes is not None
+    )
+    history_complete = False
+    history_complete_until = start
+    try:
+      if history_available:
+        (
+          history_states,
+          history_complete,
+          history_complete_until,
+        ) = await get_instance(self.hass).async_add_executor_job(
+          _fetch_state_history_states
+        )
+      else:
+        history_states = []
+    except Exception:
+      _LOGGER.exception(
+        "HomeTiles state history Recorder query failed for %s", entity_id
+      )
+      history_states = []
+      history_available = False
+      history_complete = False
+      history_complete_until = start
+
+    response = build_state_history_response(
+      entity_id,
+      history_states,
+      current_state,
+      start,
+      end,
+      request.hours,
+      request.max_transitions,
+      history_available=history_available,
+      history_complete=history_complete,
+      history_complete_until=history_complete_until,
+    )
+    response_payload = json.dumps(
+      response,
+      ensure_ascii=False,
+      separators=(",", ":"),
+    )
+    response_bytes = len(response_payload.encode("utf-8"))
+    if response_bytes > STATE_HISTORY_MAX_RESPONSE_BYTES:
+      await _publish_error("response_too_large")
+      return
+
+    _LOGGER.debug(
+      "HomeTiles state history response for %s: %d segments, %d activity entries, %d palette entries, %d bytes, complete=%s",
+      entity_id,
+      len(response["segments"]),
+      len(response["activity"]),
+      len(response["palette"]),
+      response_bytes,
+      response["timeline_complete"],
+    )
+    await mqtt.async_publish(
+      self.hass,
+      self.history_response_topic,
+      response_payload,
+      qos=0,
+      retain=False,
+    )
+
+  async def _async_handle_binary_history_request(
+    self, parsed: Dict[str, Any]
+  ) -> None:
+    """Handle the bounded, versioned binary history protocol."""
+    entity_id = str(parsed.get("entity_id") or "").strip()
+
+    async def _publish_error(code: str) -> None:
+      _LOGGER.warning(
+        "Tab5 binary history request failed for %s: %s",
+        entity_id or "<missing>",
+        code,
+      )
+      await mqtt.async_publish(
+        self.hass,
+        self.history_response_topic,
+        json.dumps(
+          build_binary_history_error(entity_id, code),
+          separators=(",", ":"),
+        ),
+        qos=0,
+        retain=False,
+      )
+
+    try:
+      request = parse_binary_history_request(parsed)
+    except BinaryHistoryRequestError as err:
+      await _publish_error(err.code)
+      return
+
+    if not entity_id:
+      await _publish_error("missing_entity_id")
+      return
+    if not entity_id.startswith("binary_sensor."):
+      await _publish_error("invalid_entity_id")
+      return
+    if entity_id not in self.binary_sensors:
+      await _publish_error("entity_not_configured")
+      return
+
+    end = dt_util.utcnow()
+    start = end - timedelta(hours=request.hours)
+    current_state = self.hass.states.get(entity_id)
+
+    def _state_change_time(state: Any) -> Optional[datetime]:
+      value = getattr(state, "last_updated", None)
+      if value is None:
+        value = getattr(state, "last_changed", None)
+      return value if isinstance(value, datetime) else None
+
+    def _fetch_recent_legacy_states() -> Tuple[List[Any], bool, datetime]:
+      if get_last_state_changes is None:
+        return [], False, start
+      recent_limit = request.max_transitions + 1
+      recent_history = get_last_state_changes(
+        self.hass,
+        recent_limit,
+        entity_id,
+      )
+      recent_states = (
+        list(recent_history.get(entity_id, [])) if recent_history else []
+      )[-recent_limit:]
+      complete_until = start
+      for state in recent_states:
+        moment = _state_change_time(state)
+        if moment is not None and moment > complete_until:
+          complete_until = moment
+      return recent_states, False, complete_until
+
+    def _fetch_recent_tail_states() -> List[Any]:
+      if get_last_state_changes is None:
+        return []
+      recent_history = get_last_state_changes(
+        self.hass,
+        BINARY_HISTORY_RECORDER_RECENT_ROWS,
+        entity_id,
+      )
+      return (
+        list(recent_history.get(entity_id, []))
+        if recent_history
+        else []
+      )[-BINARY_HISTORY_RECORDER_RECENT_ROWS:]
+
+    def _fetch_binary_history_states() -> Tuple[List[Any], bool, datetime]:
+      if state_changes_during_period is None:
+        return _fetch_recent_legacy_states()
+
+      history_states: List[Any] = []
+      cursor = start
+      include_start_state = True
+      scanned_changes = 0
+      complete_until = start
+
+      while scanned_changes < BINARY_HISTORY_RECORDER_MAX_CHANGES:
+        page_limit = min(
+          BINARY_HISTORY_RECORDER_PAGE_SIZE,
+          BINARY_HISTORY_RECORDER_MAX_CHANGES - scanned_changes,
+        )
+        try:
+          page = state_changes_during_period(
+            self.hass,
+            cursor,
+            end,
+            entity_id,
+            include_start_time_state=include_start_state,
+            no_attributes=True,
+            limit=page_limit,
+          )
+        except TypeError:
+          # Compatibility fallback stays bounded for older Home Assistant
+          # recorder signatures that do not support paged queries.
+          if not history_states:
+            return _fetch_recent_legacy_states()
+          return (
+            history_states + _fetch_recent_tail_states(),
+            False,
+            complete_until,
+          )
+
+        candidate_limit = page_limit + (1 if include_start_state else 0)
+        candidates = (
+          list(page.get(entity_id, []))[:candidate_limit]
+          if page
+          else []
+        )
+        page_changes: List[Tuple[datetime, Any]] = []
+        if include_start_state:
+          for candidate in candidates:
+            moment = _state_change_time(candidate)
+            if moment is None or moment <= cursor:
+              history_states.append(candidate)
+              break
+        for candidate in candidates:
+          moment = _state_change_time(candidate)
+          if moment is not None and moment > cursor:
+            page_changes.append((moment, candidate))
+
+        if not page_changes:
+          return history_states, True, end
+        page_changes.sort(key=lambda item: item[0])
+        history_states.extend(candidate for _, candidate in page_changes)
+        scanned_changes += len(page_changes)
+        next_cursor = page_changes[-1][0]
+        if next_cursor <= cursor:
+          return (
+            history_states + _fetch_recent_tail_states(),
+            False,
+            complete_until,
+          )
+        cursor = next_cursor
+        complete_until = cursor
+        include_start_state = False
+        if len(page_changes) < page_limit:
+          return history_states, True, end
+
+      return (
+        history_states + _fetch_recent_tail_states(),
+        False,
+        complete_until,
+      )
+
+    history_available = (
+      state_changes_during_period is not None
+      or get_last_state_changes is not None
+    )
+    history_complete = False
+    history_complete_until = start
+    try:
+      if history_available:
+        (
+          history_states,
+          history_complete,
+          history_complete_until,
+        ) = await get_instance(
+          self.hass
+        ).async_add_executor_job(_fetch_binary_history_states)
+      else:
+        history_states = []
+    except Exception:
+      _LOGGER.exception(
+        "Tab5 binary history recorder query failed for %s", entity_id
+      )
+      history_states = []
+      history_available = False
+      history_complete = False
+      history_complete_until = start
+
+    response = build_binary_history_response(
+      entity_id,
+      history_states,
+      current_state,
+      start,
+      end,
+      request.hours,
+      request.max_transitions,
+      history_available=history_available,
+      history_complete=history_complete,
+      history_complete_until=history_complete_until,
+    )
+    _LOGGER.debug(
+      "Tab5 binary history response for %s: %d segments, %d activity entries, complete=%s",
+      entity_id,
+      len(response["segments"]),
+      len(response["activity"]),
+      response["timeline_complete"],
+    )
+    await mqtt.async_publish(
+      self.hass,
+      self.history_response_topic,
+      json.dumps(response, separators=(",", ":")),
+      qos=0,
+      retain=False,
+    )
+
   async def _async_handle_history_request(self, msg: ReceiveMessage) -> None:
     """Handle history requests from the Tab5 popup."""
     if not self.history_response_topic:
@@ -1515,9 +2360,27 @@ class Tab5Bridge:
       _LOGGER.warning("Tab5 history request ignored (invalid payload): %s", msg.payload)
       return
 
+    history_kind = str(parsed.get("kind") or "").strip().lower()
+    if history_kind == "editable":
+      if not getattr(msg, "retain", False):
+        await self._async_handle_editable_history(parsed)
+      return
+    if history_kind == STATE_HISTORY_KIND:
+      await self._async_handle_state_history_request(parsed)
+      return
+    if history_kind == BINARY_HISTORY_KIND:
+      await self._async_handle_binary_history_request(parsed)
+      return
+
     entity_id = str(parsed.get("entity_id") or "").strip()
     if not entity_id:
       _LOGGER.warning("Tab5 history request ignored (missing entity_id)")
+      return
+    # Only configured entities may be read. Binary sensors stay allowed for
+    # legacy Sensor tiles of firmware before v0.6.9. The numeric protocol has
+    # no error field, so an unconfigured entity gets no reply at all.
+    if entity_id not in self.sensors and entity_id not in self.binary_sensors:
+      _LOGGER.debug("Tab5 history request ignored (entity not configured): %s", entity_id)
       return
 
     hours = _coerce_int(parsed.get("hours"), 24, 1, 168)
@@ -2118,7 +2981,7 @@ class Tab5Bridge:
       1 for e in result_entries
       if e.get("is_cost") and any(v is not None for v in e.get("values", []))
     )
-    _LOGGER.warning(
+    _LOGGER.debug(
       "Tab5 energy response: period=%s entries=%d cost_entries=%d cost_entries_with_values=%d",
       period,
       len(result_entries),
@@ -2137,6 +3000,9 @@ class Tab5Bridge:
       if not _is_weather_entity(entity_id):
         _LOGGER.debug("Tab5 weather request ignored for non-weather entity %s", entity_id)
         return
+      if entity_id not in self.weathers:
+        _LOGGER.debug("Tab5 weather request ignored for unconfigured entity %s", entity_id)
+        return
       state = self.hass.states.get(entity_id)
       if not state:
         _LOGGER.debug("Tab5 weather request ignored for missing entity %s", entity_id)
@@ -2151,27 +3017,22 @@ class Tab5Bridge:
       await self._async_publish_weather_state(weather_entity, state, retain=True)
 
   async def _async_handle_scene_command(self, msg: ReceiveMessage) -> None:
-    """Execute scene/script commands originating from the Tab5."""
+    """Run a configured scene/script or press a configured button."""
+    if getattr(msg, "retain", False):
+      return
     payload = msg.payload.strip()
     if not payload:
       return
-
-    entity_id: Optional[str]
-    if payload.startswith("scene.") or payload.startswith("script."):
-      entity_id = payload
-    else:
-      entity_id = self.scene_map.get(payload.lower())
-
-    if not entity_id:
-      _LOGGER.warning("Unhandled scene command from Tab5: %s", payload)
+    entity_id = resolve_action_entity(payload, self.scene_map)
+    call = build_action_service_call(
+      payload, self.scene_map, self.hass.states.get(entity_id) if entity_id else None,
+    )
+    if not call:
+      _LOGGER.debug("Ignoring unsupported or unavailable HomeTiles action: %s", payload)
       return
-
-    domain = entity_id.split(".")[0]
+    domain, service, service_data = call
     await self.hass.services.async_call(
-      domain,
-      "turn_on",
-      {"entity_id": entity_id},
-      blocking=False,
+      domain, service, service_data, blocking=False,
     )
 
   async def _async_handle_light_command(self, msg: ReceiveMessage) -> None:
@@ -2239,7 +3100,9 @@ class Tab5Bridge:
     )
 
   async def _async_handle_switch_command(self, msg: ReceiveMessage) -> None:
-    """Execute switch commands originating from the Tab5."""
+    """Execute on/off commands for configured switch-compatible entities."""
+    if getattr(msg, "retain", False):
+      return
     payload = msg.payload.strip()
     if not payload:
       return
@@ -2263,7 +3126,7 @@ class Tab5Bridge:
       if command is None:
         command = parsed_command
 
-    entity_id = self._resolve_target_entity(entity_id, self.switches)
+    entity_id = resolve_control_entity(entity_id, self.switches)
     if not entity_id:
       _LOGGER.warning("Unhandled switch command from Tab5 (unknown entity): %s", msg.payload)
       return
@@ -2273,12 +3136,15 @@ class Tab5Bridge:
       _LOGGER.warning("Unhandled switch command from Tab5: %s", msg.payload)
       return
 
-    service = "toggle" if command == "toggle" else "turn_on" if command == "on" else "turn_off"
+    call = build_switch_service_call(
+      entity_id, command, self.switches, self.hass.states.get(entity_id),
+    )
+    if not call:
+      _LOGGER.debug("Ignoring unsupported or unavailable HomeTiles switch: %s", entity_id)
+      return
+    domain, service, service_data = call
     await self.hass.services.async_call(
-      "switch",
-      service,
-      {"entity_id": entity_id},
-      blocking=False,
+      domain, service, service_data, blocking=False,
     )
 
   async def _async_handle_climate_command(self, msg: ReceiveMessage) -> None:
@@ -2298,73 +3164,14 @@ class Tab5Bridge:
       )
       return
 
-    command = str(parsed.get("command") or parsed.get("service") or "").strip().lower()
-    service = ""
-    service_data: Dict[str, Any] = {"entity_id": entity_id}
-
-    hvac_mode = str(parsed.get("hvac_mode") or "").strip().lower()
-    if command == "set_hvac_mode" or hvac_mode:
-      if not hvac_mode:
-        _LOGGER.warning("Climate HVAC command is missing hvac_mode: %s", msg.payload)
-        return
-      service = "set_hvac_mode"
-      service_data["hvac_mode"] = hvac_mode
-    elif command in ("turn_on", "turn_off", "toggle"):
-      service = command
-    elif command == "set_humidity" or parsed.get("humidity") is not None:
-      humidity = _coerce_float(parsed.get("humidity"))
-      if humidity is None:
-        _LOGGER.warning("Climate humidity command is invalid: %s", msg.payload)
-        return
-      service = "set_humidity"
-      service_data["humidity"] = humidity
-    elif command == "set_fan_mode" or parsed.get("fan_mode") is not None:
-      fan_mode = str(parsed.get("fan_mode") or "").strip()
-      if not fan_mode:
-        _LOGGER.warning("Climate fan command is missing fan_mode: %s", msg.payload)
-        return
-      service = "set_fan_mode"
-      service_data["fan_mode"] = fan_mode
-    elif command == "set_swing_mode" or parsed.get("swing_mode") is not None:
-      swing_mode = str(parsed.get("swing_mode") or "").strip()
-      if not swing_mode:
-        _LOGGER.warning("Climate swing command is missing swing_mode: %s", msg.payload)
-        return
-      service = "set_swing_mode"
-      service_data["swing_mode"] = swing_mode
-    elif (
-      command == "set_swing_horizontal_mode"
-      or parsed.get("swing_horizontal_mode") is not None
-    ):
-      swing_mode = str(parsed.get("swing_horizontal_mode") or "").strip()
-      if not swing_mode:
-        _LOGGER.warning(
-          "Climate horizontal swing command is missing swing_horizontal_mode: %s",
-          msg.payload,
-        )
-        return
-      service = "set_swing_horizontal_mode"
-      service_data["swing_horizontal_mode"] = swing_mode
-    elif command == "set_preset_mode" or parsed.get("preset_mode") is not None:
-      preset_mode = str(parsed.get("preset_mode") or "").strip()
-      if not preset_mode:
-        _LOGGER.warning("Climate preset command is missing preset_mode: %s", msg.payload)
-        return
-      service = "set_preset_mode"
-      service_data["preset_mode"] = preset_mode
-    else:
-      for key in ("temperature", "target_temp_low", "target_temp_high"):
-        if parsed.get(key) is None:
-          continue
-        value = _coerce_float(parsed.get(key))
-        if value is None:
-          _LOGGER.warning("Climate temperature command has invalid %s: %s", key, msg.payload)
-          return
-        service_data[key] = value
-      if len(service_data) == 1:
-        _LOGGER.warning("Climate command is missing a supported action: %s", msg.payload)
-        return
-      service = "set_temperature"
+    state = self.hass.states.get(entity_id)
+    attributes = state.attributes if state is not None else {}
+    try:
+      service, command_data = build_climate_service_call(parsed, attributes)
+    except ValueError as err:
+      _LOGGER.warning("Climate command rejected (%s): %s", err, msg.payload)
+      return
+    service_data: Dict[str, Any] = {"entity_id": entity_id, **command_data}
 
     await self.hass.services.async_call(
       "climate",
@@ -2408,6 +3215,18 @@ class Tab5Bridge:
       _LOGGER.warning("Cover command is missing a supported action: %s", msg.payload)
       return
 
+    state = self.hass.states.get(entity_id)
+    attributes = state.attributes if state is not None else {}
+    if "supported_features" in attributes and not cover_command_supported(
+      command, attributes.get("supported_features")
+    ):
+      _LOGGER.warning(
+        "Cover command %s is not supported by %s",
+        command,
+        entity_id,
+      )
+      return
+
     service_data: Dict[str, Any] = {"entity_id": entity_id}
     if command == "set_cover_position":
       position = parse_cover_position(parsed.get("position"))
@@ -2428,6 +3247,11 @@ class Tab5Bridge:
       service_data,
       blocking=False,
     )
+
+  def _is_local_camera_self_loop(self, entity_id: str) -> bool:
+    """Return whether the panel asked to stream its own built-in camera."""
+    registry_entry = er.async_get(self.hass).async_get(entity_id)
+    return is_local_camera_self_loop(registry_entry, DOMAIN, self.entry.entry_id)
 
   async def _async_handle_camera_command(self, msg: ReceiveMessage) -> None:
     """Create or stop the short-lived JPEG-frame stream used by the popup."""
@@ -2452,6 +3276,25 @@ class Tab5Bridge:
         json.dumps({
           "status": "stopped",
           "entity_id": entity_id or requested_entity or "",
+          "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
+        }),
+        qos=0,
+        retain=False,
+      )
+      return
+
+    if command == "open" and entity_id and self._is_local_camera_self_loop(entity_id):
+      _LOGGER.warning(
+        "HomeTiles camera stream refused for %s: it is this panel's own camera",
+        entity_id,
+      )
+      await mqtt.async_publish(
+        self.hass,
+        status_topic,
+        json.dumps({
+          "status": "error",
+          "entity_id": entity_id,
+          "error": "camera_self_loop",
           "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
         }),
         qos=0,
@@ -2484,6 +3327,22 @@ class Tab5Bridge:
         parsed.get("height", CAMERA_STREAM_HEIGHT),
         parsed.get("fps", CAMERA_STREAM_FPS),
       )
+
+      async def _async_notify_panel_end(stopped_entity: str = entity_id) -> None:
+        # The camera's panel ended the live view: this popup shows "stopped".
+        await mqtt.async_publish(
+          self.hass,
+          status_topic,
+          json.dumps({
+            "status": "stopped",
+            "entity_id": stopped_entity,
+            "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
+          }),
+          qos=0,
+          retain=False,
+        )
+
+      session.on_panel_end = _async_notify_panel_end
       _LOGGER.info(
         "HomeTiles camera session ready (%s, mode=%s, %dx%d@%d)",
         entity_id,
@@ -2640,20 +3499,28 @@ class Tab5Bridge:
     )
 
   def _resolve_target_entity(self, entity_id: Optional[str], candidates: List[str]) -> Optional[str]:
+    """Accept only a configured entity; legacy commands may omit a single target."""
     if entity_id:
       entity_id = entity_id.strip()
-      if "." in entity_id:
-        return entity_id
-      return None
-    if len(candidates) == 1:
-      return candidates[0]
-    return None
+    return resolve_control_entity(entity_id, candidates)
 
   @callback
   def _handle_state_event(self, event) -> None:
     entity_id = event.data.get("entity_id")
     new_state = event.data.get("new_state")
-    if not entity_id or not new_state:
+    if not entity_id:
+      return
+    if entity_id.startswith("weather.") and entity_id in self.weathers:
+      self._sync_weather_subscriptions()
+    if new_state is None:
+      if entity_id in getattr(self, "numbers", []) + getattr(self, "selects", []) + getattr(self, "datetimes", []):
+        self.hass.async_create_task(self._async_publish_editable_state(entity_id, None))
+      if entity_id in self.binary_sensors:
+        self.hass.async_create_task(
+          self._async_publish_binary_sensor_absent_state(entity_id)
+        )
+      elif entity_id in self.switches:
+        self.hass.async_create_task(self._async_publish_switch_absent_state(entity_id))
       return
 
     self.hass.async_create_task(self._async_publish_entity_state(entity_id, new_state))
@@ -2714,6 +3581,9 @@ class Tab5Bridge:
     """Publish only the icon map; lightweight, no full config push."""
     if not self.icons_topic:
       return
+    # Entities and registry overrides may become available after startup without
+    # a state event. Never follow a fresh config with an older empty icon map.
+    self._prime_icon_cache()
     payload = json.dumps(self._icon_cache)
     await mqtt.async_publish(self.hass, self.icons_topic, payload, qos=0, retain=False)
 
@@ -2722,6 +3592,12 @@ class Tab5Bridge:
     entity_id: str,
     forecast_type: str,
   ) -> Optional[List[Dict[str, Any]]]:
+    state = self.hass.states.get(entity_id)
+    features = (state.attributes or {}).get("supported_features") if state else None
+    required_feature = FORECAST_FEATURES.get(forecast_type)
+    if isinstance(features, int) and required_feature and not features & required_feature:
+      return None
+
     now = dt_util.utcnow()
     cache_key = (entity_id, forecast_type)
     cached = self._forecast_cache.get(cache_key)
@@ -2729,6 +3605,10 @@ class Tab5Bridge:
       return cached[1]
 
     forecast = await self._fetch_weather_forecast(entity_id, forecast_type)
+    updated = self._forecast_cache.get(cache_key)
+    if updated is not cached:
+      # A subscription update received during the service call is newer.
+      return updated[1] if updated else None
     if forecast:
       self._forecast_cache[cache_key] = (now, forecast)
     return forecast
@@ -2808,6 +3688,15 @@ class Tab5Bridge:
       self._icon_cache[entity_id] = icon
 
   def _build_state_payload(self, entity_id: str, state: State) -> str:
+    if entity_id.startswith("binary_sensor."):
+      return json.dumps(
+        build_binary_sensor_state_payload(
+          state.state,
+          state.attributes or {},
+          state.last_changed,
+          icon=_extract_mdi_icon(state, self.hass),
+        )
+      )
     if entity_id.startswith("light."):
       payload: Dict[str, Any] = {"state": state.state}
       attrs = state.attributes or {}
@@ -2865,58 +3754,165 @@ class Tab5Bridge:
       return json.dumps(build_cover_state_payload(state.state, state.attributes or {}))
     if entity_id.startswith("climate."):
       attrs = state.attributes or {}
-      payload: Dict[str, Any] = {
-        "state": state.state,
-        "hvac_mode": state.state,
-      }
-      for key in (
-        "hvac_action",
-        "current_temperature",
-        "current_humidity",
-        "temperature",
-        "target_humidity",
-        "humidity",
-        "target_temp_low",
-        "target_temp_high",
-        "min_temp",
-        "max_temp",
-        "min_humidity",
-        "max_humidity",
-        "target_temp_step",
-        "precision",
-        "hvac_modes",
-        "fan_mode",
-        "fan_modes",
-        "preset_mode",
-        "preset_modes",
-        "swing_mode",
-        "swing_modes",
-        "swing_horizontal_mode",
-        "swing_horizontal_modes",
-      ):
-        value = attrs.get(key)
-        if value is not None:
-          payload[key] = value
-      unit = attrs.get("temperature_unit") or attrs.get("unit_of_measurement")
-      if not unit:
-        unit = getattr(self.hass.config.units, "temperature_unit", None)
-      if unit:
-        payload["temperature_unit"] = str(unit)
-      return json.dumps(payload, default=str)
+      unit = getattr(self.hass.config.units, "temperature_unit", None)
+      return json.dumps(
+        build_climate_state_payload(state.state, attrs, unit),
+        default=str,
+      )
     if entity_id.startswith("media_player."):
       return json.dumps(_extract_media_player_payload(state, self.hass), default=str)
+    if entity_id.startswith("sensor."):
+      return sensor_live_state_payload(state)
+    # Preserve the established wire format for existing switch entities.
+    if entity_domain(entity_id) == "switch" and state.state in ("on", "off", "unavailable"):
+      return state.state
+    if entity_domain(entity_id) in SWITCH_DOMAINS:
+      return json.dumps(build_switch_state_payload(entity_id, state.state, state.attributes or {}))
     return state.state.replace(",", ".")
 
-  async def _async_publish_weather_state(self, entity_id: str, state: State, retain: bool = True) -> None:
+  @callback
+  def _weather_started(self, _hass) -> None:
+    self._sync_weather_subscriptions()
+
+  @callback
+  def _sync_weather_subscriptions(self) -> None:
+    """Use the same forecast subscriptions as Home Assistant's weather UI."""
+    if not self._runtime_setup_complete or not self.hass.is_running:
+      return
+    component = self.hass.data.get(WEATHER_DATA_COMPONENT)
+    desired = {}
+    for entity_id in self.weathers:
+      entity = component.get_entity(entity_id) if component else None
+      if entity is None or self.hass.states.get(entity_id) is None:
+        continue
+      features = entity.supported_features or 0
+      for forecast_type, feature in FORECAST_FEATURES.items():
+        if features & feature:
+          desired[(entity_id, forecast_type)] = entity
+
+    for key, (entity, unsubscribe, _token) in tuple(self._weather_subscriptions.items()):
+      if desired.get(key) is not entity:
+        self._weather_subscriptions.pop(key)
+        unsubscribe()
+        self._forecast_cache.pop(key, None)
+    for key, entity in desired.items():
+      if key not in self._weather_subscriptions:
+        self._subscribe_weather_forecast(key, entity)
+    for entity_id in tuple(self._weather_last_payload):
+      if entity_id not in self.weathers:
+        self._weather_last_payload.pop(entity_id, None)
+        self._weather_revision.pop(entity_id, None)
+
+  @callback
+  def _subscribe_weather_forecast(self, key, entity) -> None:
+    entity_id, forecast_type = key
+    token = object()
+
+    @callback
+    def _forecast_updated(forecast) -> None:
+      subscription = self._weather_subscriptions.get(key)
+      if not self._runtime_setup_complete or subscription is None or subscription[2] is not token:
+        return
+      cleaned = _sanitize_forecast_list(forecast) or []
+      _apply_forecast_icons(cleaned)
+      self._forecast_cache[key] = (dt_util.utcnow(), cleaned)
+      self._weather_revision[entity_id] = self._weather_revision.get(entity_id, 0) + 1
+      self._queue_weather_update(entity_id)
+
+    unsubscribe = entity.async_subscribe_forecast(forecast_type, _forecast_updated)
+    self._weather_subscriptions[key] = (entity, unsubscribe, token)
+    self._forecast_cache[key] = (dt_util.utcnow(), [])
+    # Subscribe before requesting the initial snapshot so later updates cannot be lost.
+    self._weather_initial_updates.setdefault(entity_id, set()).add(forecast_type)
+    self._queue_weather_update(entity_id)
+
+  @callback
+  def _queue_weather_update(self, entity_id: str) -> None:
+    if not self._runtime_setup_complete or entity_id not in self.weathers:
+      return
+    self._weather_pending.add(entity_id)
+    if self._weather_update_task is None:
+      # Coalesce same-loop day/night/hourly callbacks without a timed delay.
+      self._weather_update_task = self.hass.async_create_task(
+        self._async_process_weather_updates(), eager_start=False
+      )
+
+  async def _async_process_weather_updates(self) -> None:
+    try:
+      while self._runtime_setup_complete and self._weather_pending:
+        entity_id = self._weather_pending.pop()
+        initial_types = self._weather_initial_updates.pop(entity_id, set())
+        try:
+          for forecast_type in initial_types:
+            subscription = self._weather_subscriptions.get((entity_id, forecast_type))
+            if subscription is not None:
+              entity = subscription[0]
+              try:
+                await entity.async_update_listeners({forecast_type})
+              except Exception:
+                _LOGGER.debug("Tab5 initial forecast unavailable for %s (%s)",
+                              entity_id, forecast_type, exc_info=True)
+          if entity_id not in self.weathers or not self._owns_state_publish(entity_id):
+            continue
+          state = self.hass.states.get(entity_id)
+          if state is not None and self._runtime_setup_complete:
+            await self._async_publish_weather_state(entity_id, state, only_if_changed=True)
+        except Exception:
+          _LOGGER.debug("Tab5 weather update failed for %s", entity_id, exc_info=True)
+    finally:
+      self._weather_update_task = None
+
+  async def _async_stop_weather_updates(self, _event=None) -> None:
+    """Remove forecast/start/stop listeners and cancel an in-flight publication."""
+    self._runtime_setup_complete = False
+    for name in ("_unsub_weather_stop", "_unsub_weather_started"):
+      unsubscribe = getattr(self, name)
+      if unsubscribe is not None:
+        unsubscribe()
+        setattr(self, name, None)
+    subscriptions = list(self._weather_subscriptions.values())
+    self._weather_subscriptions.clear()
+    for _entity, unsubscribe, _token in subscriptions:
+      unsubscribe()
+    task = self._weather_update_task
+    if task is not None:
+      task.cancel()
+      try:
+        await task
+      except asyncio.CancelledError:
+        pass
+    self._weather_update_task = None
+    self._weather_pending.clear()
+    self._weather_initial_updates.clear()
+    self._weather_last_payload.clear()
+    self._weather_revision.clear()
+    self._forecast_cache.clear()
+
+  async def _async_publish_weather_state(
+    self, entity_id: str, state: State, retain: bool = True, *, only_if_changed: bool = False
+  ) -> None:
+    revision = self._weather_revision.get(entity_id, 0)
     payload = await self._build_weather_payload(entity_id, state)
+    if not self._runtime_setup_complete or revision != self._weather_revision.get(entity_id, 0):
+      return
+    if only_if_changed and self._weather_last_payload.get(entity_id) == payload:
+      return
     topic = self._ha_topic_for_entity(entity_id, "weather")
     await mqtt.async_publish(self.hass, topic, payload, qos=0, retain=retain)
+    if entity_id in self.weathers:
+      self._weather_last_payload[entity_id] = payload
 
   async def _build_weather_payload(self, entity_id: str, state: State) -> str:
     payload = _extract_weather_payload(state, self.hass)
     daily_forecast = payload.get("forecast")
     if not isinstance(daily_forecast, list) or not daily_forecast:
       daily_forecast = await self._get_weather_forecast(entity_id, FORECAST_DAILY_TYPE)
+
+    twice_daily_forecast = None
+    if not daily_forecast:
+      twice_daily_forecast = await self._get_weather_forecast(entity_id, FORECAST_TWICE_DAILY_TYPE)
+      if twice_daily_forecast:
+        daily_forecast = _build_daily_forecast_from_periods(twice_daily_forecast, twice_daily=True)
 
     hourly_forecast = await self._get_weather_forecast(entity_id, FORECAST_HOURLY_TYPE)
 
@@ -2928,11 +3924,11 @@ class Tab5Bridge:
         local_day = _forecast_entry_local_date(entry)
         if local_day is not None:
           entry["date_local"] = local_day.isoformat()
-      if hourly_forecast:
+      if hourly_forecast and not twice_daily_forecast:
         prepared_daily = _merge_hourly_precip_into_daily(prepared_daily, hourly_forecast)
 
     if hourly_forecast:
-      built_daily = _build_daily_forecast_from_hourly(hourly_forecast)
+      built_daily = _build_daily_forecast_from_periods(hourly_forecast)
       if prepared_daily:
         by_day: Dict[str, Dict[str, Any]] = {}
         for entry in built_daily:
@@ -2961,10 +3957,10 @@ class Tab5Bridge:
     path = entity_id.replace(".", "/")
     return f"{self.ha_prefix}/{path}/{suffix}"
 
-  def _build_sensor_meta(self) -> List[Dict[str, str]]:
-    meta: List[Dict[str, str]] = []
+  def _build_sensor_meta(self) -> List[Dict[str, Any]]:
+    meta: List[Dict[str, Any]] = []
     for entity_id in self.sensors:
-      entry: Dict[str, str] = {"entity_id": entity_id}
+      entry: Dict[str, Any] = {"entity_id": entity_id}
       state: Optional[State] = self.hass.states.get(entity_id)
       if state:
         unit = state.attributes.get("unit_of_measurement")
@@ -2982,6 +3978,7 @@ class Tab5Bridge:
           entry["value"] = value.strip()
         if isinstance(icon, str) and icon.strip():
           entry["icon"] = icon.strip()
+        entry["state_kind"] = sensor_state_kind(state)
       meta.append(entry)
     return meta
 
@@ -3015,6 +4012,23 @@ class Tab5Bridge:
           entry["state"] = value.strip()
         if isinstance(icon, str) and icon.strip():
           entry["icon"] = icon.strip()
+      meta.append(entry)
+    return meta
+
+  def _build_binary_sensor_meta(self) -> List[Dict[str, Any]]:
+    meta: List[Dict[str, Any]] = []
+    for entity_id in self.binary_sensors:
+      entry: Dict[str, Any] = {"entity_id": entity_id}
+      state: Optional[State] = self.hass.states.get(entity_id)
+      if state:
+        entry = build_binary_sensor_meta_entry(
+          entity_id,
+          state.state,
+          state.attributes or {},
+          state.last_changed,
+          name=state.name,
+          icon=_extract_mdi_icon(state, self.hass),
+        )
       meta.append(entry)
     return meta
 
@@ -3418,10 +4432,13 @@ def _merge_hourly_precip_into_daily(
   return merged
 
 
-def _build_daily_forecast_from_hourly(hourly_forecast: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_daily_forecast_from_periods(
+  forecast: List[Dict[str, Any]], *, twice_daily: bool = False,
+) -> List[Dict[str, Any]]:
+  """Aggregate local dates, using period lows and daytime icons for twice-daily data."""
   buckets: Dict[date, Dict[str, Any]] = {}
 
-  for entry in hourly_forecast:
+  for entry in forecast:
     if not isinstance(entry, dict):
       continue
     forecast_day = _forecast_entry_local_date(entry)
@@ -3447,7 +4464,11 @@ def _build_daily_forecast_from_hourly(hourly_forecast: List[Dict[str, Any]]) -> 
     temperature = _weather_number(entry.get("temperature"))
     if temperature is not None:
       bucket["high"] = temperature if bucket["high"] is None else max(bucket["high"], temperature)
-      bucket["low"] = temperature if bucket["low"] is None else min(bucket["low"], temperature)
+    low = _weather_number(entry.get("templow")) if twice_daily else None
+    if low is None:
+      low = temperature
+    if low is not None:
+      bucket["low"] = low if bucket["low"] is None else min(bucket["low"], low)
 
     precipitation = _weather_number(entry.get("precipitation"))
     if precipitation is not None:
@@ -3465,6 +4486,9 @@ def _build_daily_forecast_from_hourly(hourly_forecast: List[Dict[str, Any]]) -> 
     local_dt = _forecast_entry_local_datetime(entry)
     hour = local_dt.hour if local_dt is not None else None
     distance = abs(hour - 12) if hour is not None else 99
+    if twice_daily:
+      # Providers may use the same timestamp for both periods. Use HA's explicit flag.
+      distance = 0 if entry.get("is_daytime") is True else 1
     if distance <= bucket["midday_distance"]:
       bucket["midday_distance"] = distance
       bucket["condition"] = entry.get("condition")
@@ -4012,8 +5036,8 @@ def _extract_weather_payload(state: State, hass: Optional[HomeAssistant] = None)
   forecast = _sanitize_forecast_list(attrs.get("forecast"))
   if forecast:
     _apply_forecast_icons(forecast)
-    if len(forecast) > FORECAST_LIMIT:
-      forecast = forecast[:FORECAST_LIMIT]
+    if len(forecast) > FORECAST_DAILY_LIMIT:
+      forecast = forecast[:FORECAST_DAILY_LIMIT]
     payload["forecast"] = forecast
 
   return payload
@@ -4023,20 +5047,32 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
   try:
     data = _payload_to_entry_data(payload)
   except ValueError as err:
-    _LOGGER.warning("Tab5 LVGL: Konfigurationspayload ignoriert (%s)", err)
+    _LOGGER.warning("HomeTiles Bridge ignored configuration payload (%s)", err)
     return
 
   device_id = data.get(CONF_DEVICE_ID)
   entry = _find_entry_by_device_id(hass, device_id)
 
+  if entry and entry.source == config_entries.SOURCE_IGNORE:
+    # The user ignored this panel's discovery card: store nothing for it.
+    return
+
   if entry:
+    runtime_sensor_ids = _runtime_managed_sensor_entity_ids(hass, entry, data)
+    data[CONF_SENSORS] = filter_runtime_sensor_entities(
+      data.get(CONF_SENSORS, []), runtime_sensor_ids
+    )
+    existing, cleaned_options, data_cleaned, options_cleaned, removed_count = (
+      clean_stored_sensor_selections(
+        entry.data, entry.options, CONF_SENSORS, runtime_sensor_ids
+      )
+    )
     # Geraet ist bereits verbunden - trotzdem pruefen, ob die Firmware jetzt
     # Geraetename/Hersteller/Modell mitliefert, die beim urspruenglichen
     # Verbinden noch fehlten (z.B. nach einem Firmware-Update). Ein vom Nutzer
     # manuell gesetzter Wert (siehe entry_device_name()) bleibt unangetastet,
     # da hier nur echte Luecken aufgefuellt werden, nie Bestehendes ueberschrieben.
-    existing = dict(entry.data)
-    changed = False
+    changed = data_cleaned or options_cleaned
     for key in (CONF_MANUFACTURER, CONF_MODEL, CONF_DEVICE_NAME):
       if not existing.get(key) and data.get(key):
         existing[key] = data[key]
@@ -4047,13 +5083,16 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     # dem Panel selbst (handleSaveBridge) schon vorher etwas eingerichtet
     # haben kann. Ohne dieses Nachtragen wuerde genau dieser Fall die bereits
     # gemachte Konfiguration beim ersten echten Connect stillschweigend
-    # verwerfen, weil sonst nur der SOURCE_IMPORT-Erstell-Pfad sie uebernimmt.
+    # verwerfen, weil sonst nur der Erstell-Pfad sie uebernimmt.
     for key in (
-      CONF_SENSORS, CONF_WEATHERS, CONF_LIGHTS, CONF_SWITCHES,
+      CONF_SENSORS, CONF_BINARY_SENSORS, CONF_WEATHERS, CONF_LIGHTS, CONF_SWITCHES,
       CONF_MEDIA_PLAYERS, CONF_CLIMATES, CONF_COVERS, CONF_CAMERAS,
+      CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES,
       CONF_SCENE_MAP,
     ):
-      if not existing.get(key) and data.get(key):
+      if should_import_feedback_selection(
+        existing, cleaned_options, key, data.get(key)
+      ):
         existing[key] = data[key]
         changed = True
     # Local hardware belongs to this one panel and is device-announced rather
@@ -4063,14 +5102,34 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     if CONF_LOCAL_IO in data and existing.get(CONF_LOCAL_IO) != data[CONF_LOCAL_IO]:
       existing[CONF_LOCAL_IO] = data[CONF_LOCAL_IO]
       changed = True
+    if CAPABILITIES in data and existing.get(CAPABILITIES) != data[CAPABILITIES]:
+      existing[CAPABILITIES] = data[CAPABILITIES]
+      changed = True
     if changed:
-      _LOGGER.info("Tab5 LVGL: Geraeteinfo fuer bestehende Bridge %s nachgetragen", device_id)
+      if removed_count:
+        _LOGGER.info(
+          "HomeTiles Bridge removed %s stale runtime sensor selection(s) from %s",
+          removed_count,
+          entry.entry_id,
+        )
+      _LOGGER.info("HomeTiles Bridge updated device metadata for %s", device_id)
       # The integration's regular update listener reloads the entry, so new or
       # removed local-I/O platform entities appear without a manual restart.
-      hass.config_entries.async_update_entry(entry, data=existing)
+      update: Dict[str, Any] = {"data": existing}
+      if options_cleaned:
+        update["options"] = cleaned_options
+      hass.config_entries.async_update_entry(entry, **update)
     return
 
   fallback = _find_entry_by_base(hass, data.get(CONF_BASE_TOPIC))
+  if fallback and not _may_adopt_entry(fallback, device_id):
+    # The base topic belongs to another panel; do not take over its entry.
+    _LOGGER.debug(
+      "HomeTiles Bridge ignored device %s: base topic already used by %s",
+      device_id,
+      fallback.title,
+    )
+    return
   if fallback:
     new_data = dict(fallback.data)
     changed = False
@@ -4080,10 +5139,13 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     if CONF_LOCAL_IO in data and new_data.get(CONF_LOCAL_IO) != data[CONF_LOCAL_IO]:
       new_data[CONF_LOCAL_IO] = data[CONF_LOCAL_IO]
       changed = True
+    if CAPABILITIES in data and new_data.get(CAPABILITIES) != data[CAPABILITIES]:
+      new_data[CAPABILITIES] = data[CAPABILITIES]
+      changed = True
     if not changed:
       return
 
-    _LOGGER.info("Tab5 LVGL: verknuepfe Bridge %s mit bestehender Integration", device_id)
+    _LOGGER.info("HomeTiles Bridge adopted device %s into the existing entry", device_id)
     hass.config_entries.async_update_entry(
       fallback,
       data=new_data,
@@ -4093,13 +5155,17 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     await hass.config_entries.async_reload(fallback.entry_id)
     return
 
-  _LOGGER.info("Tab5 LVGL: neue Bridge entdeckt (%s) - erstelle Integration", device_id)
-  hass.async_create_task(
-    hass.config_entries.flow.async_init(
-      DOMAIN,
-      context={"source": config_entries.SOURCE_IMPORT},
-      data=data,
-    )
+  _LOGGER.info("HomeTiles Bridge discovered device %s; waiting for confirmation", device_id)
+  data[CONF_SENSORS] = filter_runtime_sensor_entities(
+    data.get(CONF_SENSORS, []),
+    _runtime_managed_sensor_entity_ids(hass, None, data),
+  )
+  # Home Assistant shows a discovery card; the entry is created on confirm.
+  discovery_flow.async_create_flow(
+    hass,
+    DOMAIN,
+    context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+    data=data,
   )
 
 
@@ -4111,37 +5177,34 @@ def _payload_to_entry_data(payload: Dict[str, Any]) -> Dict[str, Any]:
   base = _normalise_topic(payload.get("base_topic"), DEFAULT_BASE)
   prefix = _normalise_topic(payload.get("ha_prefix"), DEFAULT_PREFIX)
 
-  sensors_raw = payload.get("sensors") or []
+  sensors_raw = payload.get("configured_sensors", payload.get("sensors")) or []
   if not isinstance(sensors_raw, list):
     raise ValueError("invalid_sensors")
   sensors = [str(item).strip() for item in sensors_raw if str(item).strip()]
+
+  binary_sensors_raw = payload.get(CONF_BINARY_SENSORS) or []
+  if not isinstance(binary_sensors_raw, list):
+    raise ValueError("invalid_binary_sensors")
+  binary_sensors = [
+    str(item).strip() for item in binary_sensors_raw if str(item).strip()
+  ]
+  if any(not entity_id.startswith("binary_sensor.") for entity_id in binary_sensors):
+    raise ValueError("invalid_binary_sensors")
 
   weathers_raw = payload.get("weathers") or []
   if not isinstance(weathers_raw, list):
     raise ValueError("invalid_weathers")
   weathers = [str(item).strip() for item in weathers_raw if str(item).strip()]
   legacy_weathers, sensors = _split_weather_entities(sensors)
+  legacy_binary_sensors, sensors = split_binary_sensor_entities(sensors)
+  binary_sensors = _unique_entities(binary_sensors + legacy_binary_sensors)
   weathers = _unique_entities(weathers + legacy_weathers)
 
-  lights_raw = payload.get("lights") or []
-  if not isinstance(lights_raw, list):
-    raise ValueError("invalid_lights")
-  lights = [str(item).strip() for item in lights_raw if str(item).strip()]
-
-  switches_raw = payload.get("switches") or []
-  if not isinstance(switches_raw, list):
-    raise ValueError("invalid_switches")
-  switches = [str(item).strip() for item in switches_raw if str(item).strip()]
-
-  media_players_raw = payload.get("media_players") or []
-  if not isinstance(media_players_raw, list):
-    raise ValueError("invalid_media_players")
-  media_players = [str(item).strip() for item in media_players_raw if str(item).strip()]
-
-  climates_raw = payload.get("climates") or []
-  if not isinstance(climates_raw, list):
-    raise ValueError("invalid_climates")
-  climates = [str(item).strip() for item in climates_raw if str(item).strip()]
+  # A panel must not add entities of other domains to the shared lists.
+  lights = panel_entity_list(payload.get("lights"), CONF_LIGHTS)
+  switches = panel_entity_list(payload.get("switches"), CONF_SWITCHES)
+  media_players = panel_entity_list(payload.get("media_players"), CONF_MEDIA_PLAYERS)
+  climates = panel_entity_list(payload.get("climates"), CONF_CLIMATES)
 
   covers_raw = payload.get("covers") or []
   if not isinstance(covers_raw, list):
@@ -4150,17 +5213,15 @@ def _payload_to_entry_data(payload: Dict[str, Any]) -> Dict[str, Any]:
   if any(not entity_id.startswith("cover.") for entity_id in covers):
     raise ValueError("invalid_covers")
 
-  cameras_raw = payload.get("cameras") or []
-  if not isinstance(cameras_raw, list):
-    raise ValueError("invalid_cameras")
-  cameras = [str(item).strip() for item in cameras_raw if str(item).strip()]
+  cameras = panel_entity_list(payload.get("cameras"), CONF_CAMERAS)
 
   scene_map_raw = payload.get("scene_map") or {}
   if not isinstance(scene_map_raw, dict):
     raise ValueError("invalid_scene_map")
   scene_map: Dict[str, str] = {}
   for alias, entity in scene_map_raw.items():
-    if not alias or not entity:
+    # Scene tiles only run scenes, scripts and buttons; drop anything else.
+    if not alias or entity_domain(entity) not in ACTION_DOMAINS:
       continue
     scene_map[str(alias).lower()] = str(entity)
 
@@ -4173,6 +5234,7 @@ def _payload_to_entry_data(payload: Dict[str, Any]) -> Dict[str, Any]:
     CONF_BASE_TOPIC: base,
     CONF_HA_PREFIX: prefix,
     CONF_SENSORS: sensors,
+    CONF_BINARY_SENSORS: binary_sensors,
     CONF_WEATHERS: weathers,
     CONF_LIGHTS: lights,
     CONF_SWITCHES: switches,
@@ -4182,12 +5244,17 @@ def _payload_to_entry_data(payload: Dict[str, Any]) -> Dict[str, Any]:
     CONF_CAMERAS: cameras,
     CONF_SCENE_MAP: scene_map,
   }
+  for key, domains in EDITABLE_LISTS.items():
+    if key in payload:
+      data[key] = editable_selection(payload[key], domains)
   if manufacturer:
     data[CONF_MANUFACTURER] = manufacturer
   if model:
     data[CONF_MODEL] = model
   if device_name:
     data[CONF_DEVICE_NAME] = device_name
+  if CAPABILITIES in payload:
+    data[CAPABILITIES] = normalise_capabilities(payload[CAPABILITIES])
   if CONF_LOCAL_IO in payload:
     local_io_raw = payload.get(CONF_LOCAL_IO)
     if local_io_raw is None:
@@ -4203,6 +5270,18 @@ def _find_entry_by_device_id(hass: HomeAssistant, device_id: Optional[str]) -> O
     if entry.data.get(CONF_DEVICE_ID) == device_id or entry.unique_id == device_id:
       return entry
   return None
+
+
+def _may_adopt_entry(entry: ConfigEntry, device_id: Optional[str]) -> bool:
+  """Only a manual entry without a panel, or a pre-v0.3.1 tab5_lvgl_XXXX
+  entry with the same MAC suffix, may be adopted by an announcing panel."""
+  bound = str(entry.data.get(CONF_DEVICE_ID) or entry.unique_id or "")
+  if not bound:
+    return True
+  return (
+    len(bound) == 14 and bound.startswith("tab5_lvgl_")
+    and str(device_id or "").upper().endswith(bound[-4:].upper())
+  )
 
 
 def _find_entry_by_base(hass: HomeAssistant, base_topic: Optional[str]) -> Optional[ConfigEntry]:

@@ -18,6 +18,7 @@ CONF_ENERGY_GAS = "energy_gas"
 CONF_ENERGY_WATER = "energy_water"
 
 CONF_SENSORS = "sensors"
+CONF_BINARY_SENSORS = "binary_sensors"
 CONF_WEATHERS = "weathers"
 CONF_LIGHTS = "lights"
 CONF_SWITCHES = "switches"
@@ -47,3 +48,19 @@ HISTORY_RESPONSE_SUFFIX = "history/response"
 ENERGY_REQUEST_SUFFIX = "energy/request"
 ENERGY_RESPONSE_SUFFIX = "energy/response"
 WEATHER_REQUEST_SUFFIX = "weather/request"
+
+CONF_NUMBERS = "numbers"
+CONF_SELECTS = "selects"
+CONF_DATETIMES = "datetimes"
+
+# On-demand still images from a panel's own camera (not CONF_CAMERAS, which
+# lists Home Assistant cameras shown on the panel).
+TOPIC_LOCAL_CAMERA = "local_camera"
+# Below Home Assistant's CAMERA_IMAGE_TIMEOUT (10 s) so a cached frame can
+# still be returned before the frontend request is abandoned.
+LOCAL_CAMERA_REQUEST_TIMEOUT_S = 6.0
+LOCAL_CAMERA_MIN_AGE_S = 1.5
+LOCAL_CAMERA_MAX_BYTES = 256 * 1024
+LOCAL_CAMERA_FRAME_INTERVAL_S = 2.0
+LOCAL_CAMERA_STALE_FALLBACK_S = 60.0
+LOCAL_CAMERA_WARNING_INTERVAL_S = 60.0
