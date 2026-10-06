@@ -29,7 +29,12 @@ CAMERA_STREAM_TCP_PORT_FIRST: Final = 8124
 CAMERA_STREAM_TCP_PORT_LAST: Final = 8131
 CAMERA_STREAM_WIDTH: Final = 752
 CAMERA_STREAM_HEIGHT: Final = 424
+# Rate for a request without "fps" (firmware before 30 FPS asked for 24).
 CAMERA_STREAM_FPS: Final = 24
+# Highest rate a panel may ask for. Frames are thinned to the requested rate
+# before scaling, so 30 costs the Bridge little; firmware since b134 asks for
+# 30 and falls back to 24 when an older Bridge rejects it.
+CAMERA_STREAM_MAX_FPS: Final = 30
 CAMERA_STREAM_MIN_WIDTH: Final = 320
 CAMERA_STREAM_MIN_HEIGHT: Final = 180
 CAMERA_STREAM_MAX_PIXELS: Final = CAMERA_STREAM_WIDTH * CAMERA_STREAM_HEIGHT
@@ -60,6 +65,20 @@ CAMERA_STREAM_CHUNK_BYTES: Final = 8 * 1024
 CAMERA_STREAM_HANDSHAKE_TIMEOUT_SECONDS: Final = 5.0
 CAMERA_STREAM_ACK_TIMEOUT_SECONDS: Final = 5.0
 CAMERA_STREAM_DIAGNOSTIC_INTERVAL_SECONDS: Final = 5.0
+# A direct stream is decoded on this many threads, next to the one thread
+# that scales and encodes. A 1440p60 stream ran at 0.9x real time in a Home
+# Assistant VM with everything on one thread. Frame threading delays the
+# output by (threads - 1) source frames.
+CAMERA_STREAM_DECODE_THREADS: Final = 4
+# FFmpeg that falls this far behind a live stream is restarted at the live
+# position. Otherwise the delay keeps growing until the stream server drops
+# data for the slow reader, which smears the H.264 picture.
+CAMERA_STREAM_MAX_LAG_SECONDS: Final = 1.0
+# Keys of FFmpeg's -progress blocks on stderr (plus stream_<i>_<j>_q).
+CAMERA_FFMPEG_PROGRESS_KEYS: Final = frozenset({
+  "frame", "fps", "bitrate", "total_size", "out_time_us", "out_time_ms",
+  "out_time", "dup_frames", "drop_frames", "speed", "progress",
+})
 CAMERA_STREAM_REQUEST_PREFIX: Final = "HTCAM/1 "
 CAMERA_STREAM_HELLO_MAGIC: Final = b"HTC1"
 CAMERA_STREAM_FRAME_MAGIC: Final = b"HTF1"
@@ -105,6 +124,43 @@ class JpegFrameParser:
       frames.append(bytes(self._buffer[:finish]))
       del self._buffer[:finish]
     return frames
+
+
+class CameraStreamLagGuard:
+  """Tell when FFmpeg decodes a live stream slower than real time.
+
+  Compares FFmpeg's output clock (-progress out_time) with the wall clock.
+  A pause without new frames is the source pausing, not decoding lag, so it
+  is not counted. Whenever FFmpeg runs ahead, for example while it catches
+  up after such a pause, the comparison starts again from there.
+  """
+
+  def __init__(self, max_lag_seconds: float) -> None:
+    self._max_lag = max_lag_seconds
+    self._base_now: float | None = None
+    self._base_out = 0.0
+    self._last_now = 0.0
+    self._last_frame = 0
+    self.lag_seconds = 0.0
+
+  def update(self, frame: int, out_time_seconds: float, now: float) -> bool:
+    """Record one progress report; True once the lag exceeds the limit."""
+    if frame <= 0:
+      return False
+    if self._base_now is None:
+      self._base_now = now
+      self._base_out = out_time_seconds
+    elif frame == self._last_frame:
+      self._base_now += now - self._last_now
+    self._last_now = now
+    self._last_frame = frame
+    lag = (now - self._base_now) - (out_time_seconds - self._base_out)
+    if lag < 0:
+      self._base_now = now
+      self._base_out = out_time_seconds
+      lag = 0.0
+    self.lag_seconds = lag
+    return lag > self._max_lag
 
 
 @dataclass(slots=True)
@@ -277,6 +333,183 @@ class CameraStreamDiagnostics:
     self.interval_max_transport_seconds = 0.0
 
 
+# Handed to the viewers of a shared stream when its FFmpeg restarts; each
+# viewer tells its panel with a flush message, as a single stream did.
+_STREAM_RESTARTED: Final = object()
+
+
+class CameraStreamViewer:
+  """One panel's place in a shared camera stream: only its newest frame."""
+
+  def __init__(self, diagnostics: CameraStreamDiagnostics) -> None:
+    self.frames: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+    self.diagnostics = diagnostics
+    self.closed = False
+
+  def offer(self, item: Any) -> None:
+    """Keep only the newest item: a slow panel skips frames, never lags."""
+    if self.closed:
+      return
+    if self.frames.full():
+      with suppress(asyncio.QueueEmpty):
+        if isinstance(self.frames.get_nowait(), bytes):
+          self.diagnostics.note_dropped()
+    self.frames.put_nowait(item)
+
+  def close(self) -> None:
+    """End this viewer's stream; nothing queued after this is delivered."""
+    if self.closed:
+      return
+    self.offer(None)
+    self.closed = True
+
+
+class CameraStreamBroadcast:
+  """One FFmpeg pipeline for every panel showing the same direct stream.
+
+  Panels asking for the same camera at the same size and rate share one
+  RTSP connection and one decode instead of one per panel. Every viewer
+  keeps only its newest frame and sends at its own acknowledged pace. The
+  pipeline restarts at the live position when it falls behind or the
+  source ends, and stops when its last viewer leaves.
+  """
+
+  def __init__(
+    self,
+    manager: CameraStreamManager,
+    key: tuple[Any, ...],
+    session: CameraStreamSession,
+    ffmpeg_binary: str,
+    jpeg_quality: int,
+  ) -> None:
+    self._manager = manager
+    self.key = key
+    # The first viewer's session: source, entity, size and rate are the key.
+    self._session = session
+    self._ffmpeg_binary = ffmpeg_binary
+    self._jpeg_quality = jpeg_quality
+    self.viewers: list[CameraStreamViewer] = []
+    self._stop = asyncio.Event()
+    self._process: asyncio.subprocess.Process | None = None
+    self.task: asyncio.Task[None] | None = None
+
+  def start(self) -> None:
+    self.task = self._manager.hass.async_create_task(
+      self._async_run(),
+      f"HomeTiles camera shared stream {self._session.entity_id}",
+    )
+
+  def stop(self) -> None:
+    """Stop the pipeline; its task terminates FFmpeg and closes viewers."""
+    self._stop.set()
+    process = self._process
+    if process is not None and process.returncode is None:
+      process.terminate()
+
+  async def _async_read_frames(
+    self, process: asyncio.subprocess.Process
+  ) -> int:
+    """Hand every complete JPEG to all current viewers."""
+    assert process.stdout is not None
+    parser = JpegFrameParser()
+    frames = 0
+    while (
+      not self._stop.is_set()
+      and (chunk := await process.stdout.read(16 * 1024))
+    ):
+      for jpeg in parser.feed(chunk):
+        frames += 1
+        for viewer in list(self.viewers):
+          viewer.diagnostics.note_parsed(jpeg)
+          viewer.offer(jpeg)
+    return frames
+
+  async def _async_run(self) -> None:
+    session = self._session
+    connection = self._manager.tcp_connection
+    reconnect_attempt = 0
+    lag_restarts = 0
+    try:
+      while not self._stop.is_set():
+        process: asyncio.subprocess.Process | None = None
+        stderr_task: asyncio.Task[float | None] | None = None
+        frames = 0
+        lag_seconds: float | None = None
+        command = connection._ffmpeg_command(
+          self._ffmpeg_binary, session, self._jpeg_quality
+        )
+        try:
+          process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+          )
+          self._process = process
+          if self._stop.is_set():
+            break
+          stderr_task = self._manager.hass.async_create_task(
+            connection._async_log_ffmpeg_stderr(
+              session, process, False, watch_lag=True
+            ),
+            f"HomeTiles camera FFmpeg log {session.entity_id}",
+          )
+          frames = await self._async_read_frames(process)
+        except asyncio.CancelledError:
+          raise
+        except Exception:
+          _LOGGER.exception(
+            "HomeTiles camera source process failed (%s)",
+            session.entity_id,
+          )
+        finally:
+          if process and process.returncode is None:
+            process.terminate()
+            try:
+              await asyncio.wait_for(process.wait(), timeout=2.0)
+            except TimeoutError:
+              process.kill()
+              await process.wait()
+          if stderr_task:
+            with suppress(asyncio.CancelledError):
+              lag_seconds = await stderr_task
+          self._process = None
+
+        if self._stop.is_set():
+          break
+        reconnect_attempt = (
+          0 if frames else min(reconnect_attempt + 1, 4)
+        )
+        retry_delay = min(2.0, 0.25 * (2 ** reconnect_attempt))
+        if lag_seconds is not None:
+          lag_restarts += 1
+          # Once per stream as a warning; a host that stays too slow would
+          # otherwise repeat it every few seconds.
+          (_LOGGER.warning if lag_restarts == 1 else _LOGGER.debug)(
+            "HomeTiles camera %s fell %.1fs behind the live stream; "
+            "restarting at the live position (%d in this stream)",
+            session.entity_id,
+            lag_seconds,
+            lag_restarts,
+          )
+        else:
+          _LOGGER.warning(
+            "HomeTiles camera source ended; reconnecting %s in %.2fs",
+            session.entity_id,
+            retry_delay,
+          )
+        for viewer in list(self.viewers):
+          viewer.offer(_STREAM_RESTARTED)
+        try:
+          await asyncio.wait_for(self._stop.wait(), timeout=retry_delay)
+        except TimeoutError:
+          pass
+    finally:
+      self._manager.forget_broadcast(self)
+      for viewer in list(self.viewers):
+        viewer.close()
+
+
 class CameraStreamManager:
   """Own HomeTiles camera sessions and their FFmpeg processes."""
 
@@ -295,6 +528,56 @@ class CameraStreamManager:
     self.local_camera_uploads = LocalCameraUploadRegistry()
     # HomeTiles panel cameras with a live upload, one entry per entity.
     self._live_cameras: list[Any] = []
+    # Running direct streams shared by every panel with the same camera,
+    # size, rate and JPEG quality.
+    self._broadcasts: dict[tuple[Any, ...], CameraStreamBroadcast] = {}
+
+  @property
+  def tcp_connection(self) -> CameraStreamConnection:
+    return self._tcp_connection
+
+  def join_broadcast(
+    self,
+    session: CameraStreamSession,
+    ffmpeg_binary: str,
+    jpeg_quality: int,
+    diagnostics: CameraStreamDiagnostics,
+  ) -> tuple[CameraStreamBroadcast, CameraStreamViewer]:
+    """Add a panel to the running stream of its camera, or start one."""
+    key = (
+      session.entity_id,
+      session.source,
+      session.width,
+      session.height,
+      session.fps,
+      jpeg_quality,
+    )
+    broadcast = self._broadcasts.get(key)
+    if broadcast is None:
+      broadcast = CameraStreamBroadcast(
+        self, key, session, ffmpeg_binary, jpeg_quality
+      )
+      self._broadcasts[key] = broadcast
+      broadcast.start()
+    viewer = CameraStreamViewer(diagnostics)
+    broadcast.viewers.append(viewer)
+    return broadcast, viewer
+
+  def leave_broadcast(
+    self, broadcast: CameraStreamBroadcast, viewer: CameraStreamViewer
+  ) -> None:
+    """Remove a panel; the last one leaving stops the shared pipeline."""
+    viewer.close()
+    with suppress(ValueError):
+      broadcast.viewers.remove(viewer)
+    if not broadcast.viewers:
+      self.forget_broadcast(broadcast)
+      broadcast.stop()
+
+  def forget_broadcast(self, broadcast: CameraStreamBroadcast) -> None:
+    """Let the next panel start a new pipeline instead of a stopping one."""
+    if self._broadcasts.get(broadcast.key) is broadcast:
+      del self._broadcasts[broadcast.key]
 
   def register_live_camera(self, camera: Any) -> Callable[[], None]:
     """Let popup sessions find a panel camera's live stream by entity id."""
@@ -375,6 +658,16 @@ class CameraStreamManager:
       )
     for device_id in device_ids:
       await self.async_stop_device(device_id)
+    broadcasts = list(self._broadcasts.values())
+    self._broadcasts.clear()
+    for broadcast in broadcasts:
+      for viewer in list(broadcast.viewers):
+        viewer.close()
+      broadcast.stop()
+    for broadcast in broadcasts:
+      if broadcast.task is not None:
+        with suppress(asyncio.CancelledError, Exception):
+          await broadcast.task
     self.local_camera_uploads.close_all()
     if self._tcp_server is not None:
       self._tcp_server.close()
@@ -475,7 +768,7 @@ class CameraStreamManager:
       or width * height > CAMERA_STREAM_MAX_PIXELS
       or abs(width * 9 - height * 16) > 16
       or fps < 1
-      or fps > CAMERA_STREAM_FPS
+      or fps > CAMERA_STREAM_MAX_FPS
     ):
       raise ValueError("camera_invalid_stream_request")
     return width, height, fps
@@ -1015,13 +1308,43 @@ class CameraStreamConnection:
     session: CameraStreamSession,
     process: asyncio.subprocess.Process,
     image_mode: bool,
-  ) -> None:
-    """Drain FFmpeg stderr and expose useful diagnostics for still cameras."""
+    watch_lag: bool = False,
+  ) -> float | None:
+    """Drain FFmpeg stderr and expose useful diagnostics for still cameras.
+
+    With watch_lag, FFmpeg's -progress reports are compared with the wall
+    clock. When FFmpeg falls too far behind the live stream it is stopped,
+    and the lag in seconds is returned so the caller restarts it at the
+    live position.
+    """
     if process.stderr is None:
-      return
+      return None
+    guard = (
+      CameraStreamLagGuard(CAMERA_STREAM_MAX_LAG_SECONDS) if watch_lag else None
+    )
+    report: dict[str, str] = {}
     while line := await process.stderr.readline():
       message = line.decode(errors="replace").strip()
       if not message:
+        continue
+      key, separator, value = message.partition("=")
+      if separator and (
+        key in CAMERA_FFMPEG_PROGRESS_KEYS or key.startswith("stream_")
+      ):
+        report[key] = value.strip()
+        if key != "progress":
+          continue
+        try:
+          frame = int(report.get("frame", "0"))
+          out_time = int(report.get("out_time_us", "")) / 1_000_000.0
+        except ValueError:
+          frame, out_time = 0, 0.0  # out_time_us=N/A before the first frame
+        report = {}
+        if guard is not None and guard.update(
+          frame, out_time, time.monotonic()
+        ):
+          process.terminate()
+          return guard.lag_seconds
         continue
       if image_mode:
         _LOGGER.warning(
@@ -1034,6 +1357,92 @@ class CameraStreamConnection:
           "HomeTiles camera FFmpeg warning (%s)",
           session.entity_id,
         )
+    return None
+
+  @staticmethod
+  def _ffmpeg_command(
+    ffmpeg_binary: str,
+    session: CameraStreamSession,
+    jpeg_quality: int,
+  ) -> list[str]:
+    """Build the FFmpeg command that turns the camera into JPEG frames."""
+    command = [ffmpeg_binary, "-hide_banner", "-loglevel", "warning"]
+    image_mode = session.source is None
+    if image_mode:
+      command.extend([
+        # image2pipe otherwise probes roughly twelve JPEGs before producing
+        # output. At low fps that otherwise leaves the P4 waiting for seconds.
+        "-probesize", "32",
+        "-analyzeduration", "0",
+        "-f", "image2pipe",
+        "-framerate", str(session.fps),
+        "-vcodec", "mjpeg",
+        "-i", "pipe:0",
+      ])
+    else:
+      assert session.source is not None
+      # Progress reports on stderr let the lag guard see whether FFmpeg
+      # keeps up with the live stream.
+      command.extend(["-progress", "pipe:2"])
+      if session.source.lower().startswith("rtsp"):
+        # No "-flags low_delay": it forces a single decoding thread.
+        command.extend([
+          "-rtsp_transport", "tcp",
+          "-fflags", "nobuffer",
+          "-probesize", "32",
+          "-analyzeduration", "0",
+          "-max_delay", "0",
+          "-timeout", "5000000",
+        ])
+      command.extend(["-threads", str(CAMERA_STREAM_DECODE_THREADS)])
+      command.extend(["-i", session.source])
+    video_filters: list[str] = []
+    scale_flags = ""
+    if not image_mode:
+      # Scaling runs on one thread and was the larger part of the work: every
+      # frame of a 60 FPS source was scaled before -fpsmax dropped most of
+      # them. Keep only the first frame of each 1/fps slot first, which never
+      # repeats a frame of a slower source. The area scaler is the cheapest
+      # of the sharp ones for this large reduction.
+      video_filters.append(
+        "select='isnan(prev_selected_t)"
+        f"+gt(floor(t*{session.fps}),floor(prev_selected_t*{session.fps}))'"
+      )
+      scale_flags = ":flags=area"
+    video_filters.extend([
+      (
+        f"scale={session.width}:{session.height}:"
+        "force_original_aspect_ratio=increase:"
+        f"out_color_matrix=bt601:out_range=full{scale_flags}"
+      ),
+      f"crop={session.width}:{session.height}",
+      "setsar=1",
+    ])
+    command.extend([
+      "-map", "0:v:0",
+      "-an",
+      "-vf", ",".join(video_filters),
+      "-pix_fmt", "yuvj420p",
+      "-color_range", "pc",
+      "-colorspace", "smpte170m",
+      "-color_primaries", "smpte170m",
+      "-color_trc", "smpte170m",
+      "-c:v", "mjpeg",
+      "-threads:v", "1",
+      "-q:v", str(jpeg_quality),
+    ])
+    if not image_mode:
+      # A fixed fps filter duplicates frames when the source is slower (for
+      # example 10 FPS from OBS), wasting ESP decode/display time and making
+      # the on-device counter look faster than the real video. fpsmax only
+      # drops excess source frames and never fabricates missing ones.
+      command.extend(["-fpsmax", str(session.fps)])
+    command.extend([
+      "-flush_packets", "1",
+      "-f", "image2pipe",
+      "pipe:1",
+    ])
+    return command
 
   async def _async_read_latest_jpeg_frames(
     self,
@@ -1075,7 +1484,6 @@ class CameraStreamConnection:
   ) -> None:
     """Transcode and send the newest frame using acknowledged chunks."""
     ffmpeg_binary = get_ffmpeg_manager(self._manager.hass).binary
-    command = [ffmpeg_binary, "-hide_banner", "-loglevel", "warning"]
     image_mode = session.source is None
     live = session.live if image_mode else None
     # A live panel upload is video, so it uses the direct-stream JPEG budget.
@@ -1084,69 +1492,35 @@ class CameraStreamConnection:
       if image_mode and live is None
       else CAMERA_STREAM_JPEG_QUALITY
     )
-    if image_mode:
-      command.extend([
-        # image2pipe otherwise probes roughly twelve JPEGs before producing
-        # output. At low fps that otherwise leaves the P4 waiting for seconds.
-        "-probesize", "32",
-        "-analyzeduration", "0",
-        "-f", "image2pipe",
-        "-framerate", str(session.fps),
-        "-vcodec", "mjpeg",
-        "-i", "pipe:0",
-      ])
-    else:
-      assert session.source is not None
-      if session.source.lower().startswith("rtsp"):
-        command.extend([
-          "-rtsp_transport", "tcp",
-          "-fflags", "nobuffer",
-          "-flags", "low_delay",
-          "-probesize", "32",
-          "-analyzeduration", "0",
-          "-max_delay", "0",
-          "-timeout", "5000000",
-        ])
-      command.extend(["-i", session.source])
-    video_filters: list[str] = []
-    video_filters.extend([
-      (
-        f"scale={session.width}:{session.height}:"
-        "force_original_aspect_ratio=increase:"
-        "out_color_matrix=bt601:out_range=full"
-      ),
-      f"crop={session.width}:{session.height}",
-      "setsar=1",
-    ])
-    command.extend([
-      "-map", "0:v:0",
-      "-an",
-      "-vf", ",".join(video_filters),
-      "-pix_fmt", "yuvj420p",
-      "-color_range", "pc",
-      "-colorspace", "smpte170m",
-      "-color_primaries", "smpte170m",
-      "-color_trc", "smpte170m",
-      "-c:v", "mjpeg",
-      "-threads:v", "1",
-      "-q:v", str(jpeg_quality),
-    ])
-    if not image_mode:
-      # A fixed fps filter duplicates frames when the source is slower (for
-      # example 10 FPS from OBS), wasting ESP decode/display time and making
-      # the on-device counter look faster than the real video. fpsmax only
-      # drops excess source frames and never fabricates missing ones.
-      command.extend(["-fpsmax", str(session.fps)])
-    command.extend([
-      "-flush_packets", "1",
-      "-f", "image2pipe",
-      "pipe:1",
-    ])
 
     sent = 0
     sent_frame_once = False
     sequence = 0
     diagnostics = CameraStreamDiagnostics(session.entity_id)
+
+    async def send_jpeg(jpeg: bytes) -> None:
+      nonlocal sequence, sent, sent_frame_once
+      sequence = (sequence + 1) & 0xFFFFFFFF
+      send_metrics = await self._async_send_frame(
+        reader,
+        writer,
+        sequence,
+        jpeg,
+      )
+      diagnostics.note_sent(jpeg, send_metrics)
+      diagnostics.maybe_log()
+      if not sent_frame_once:
+        sent_frame_once = True
+        _LOGGER.info(
+          "HomeTiles camera first JPEG frame sent "
+          "(%s, %d bytes, first_parsed=%.1f ms, first_sent=%.1f ms)",
+          session.entity_id,
+          len(jpeg),
+          diagnostics.first_parsed_ms or 0.0,
+          diagnostics.first_sent_ms or 0.0,
+        )
+      sent += len(jpeg)
+
     if live is not None:
       # The popup is a live viewer for exactly this stream's lifetime; the
       # outer finally releases it on every exit path.
@@ -1166,14 +1540,46 @@ class CameraStreamConnection:
         CAMERA_STREAM_MESSAGE_FLUSH,
         sequence,
       )
+      if not image_mode:
+        # Direct streams: every panel with the same camera, size and rate
+        # shares one FFmpeg pipeline instead of decoding it once per panel.
+        broadcast, viewer = self._manager.join_broadcast(
+          session, ffmpeg_binary, jpeg_quality, diagnostics
+        )
+        if len(broadcast.viewers) > 1:
+          _LOGGER.info(
+            "HomeTiles camera %s joins the running stream (%d panels)",
+            session.entity_id,
+            len(broadcast.viewers),
+          )
+        stop_waiter = self._manager.hass.async_create_task(
+          session.stop_event.wait(),
+          f"HomeTiles camera viewer stop {session.entity_id}",
+        )
+        stop_waiter.add_done_callback(lambda _task: viewer.close())
+        try:
+          while (item := await viewer.frames.get()) is not None:
+            if item is _STREAM_RESTARTED:
+              await self._async_send_control(
+                writer,
+                CAMERA_STREAM_MESSAGE_FLUSH,
+                sequence,
+              )
+              continue
+            await send_jpeg(item)
+        finally:
+          stop_waiter.cancel()
+          self._manager.leave_broadcast(broadcast, viewer)
+        return
       reconnect_attempt = 0
       while not session.stop_event.is_set():
         feeder: asyncio.Task[None] | None = None
-        stderr_task: asyncio.Task[None] | None = None
+        stderr_task: asyncio.Task[float | None] | None = None
         frame_reader: asyncio.Task[int] | None = None
         process: asyncio.subprocess.Process | None = None
         frames_this_process = 0
         dropped_frames = 0
+        command = self._ffmpeg_command(ffmpeg_binary, session, jpeg_quality)
         try:
           process = await asyncio.create_subprocess_exec(
             *command,
@@ -1220,27 +1626,8 @@ class CameraStreamConnection:
             jpeg = await latest_frames.get()
             if jpeg is None:
               break
-            sequence = (sequence + 1) & 0xFFFFFFFF
-            send_metrics = await self._async_send_frame(
-              reader,
-              writer,
-              sequence,
-              jpeg,
-            )
-            diagnostics.note_sent(jpeg, send_metrics)
-            diagnostics.maybe_log()
-            if not sent_frame_once:
-              sent_frame_once = True
-              _LOGGER.info(
-                "HomeTiles camera first JPEG frame sent "
-                "(%s, %d bytes, first_parsed=%.1f ms, first_sent=%.1f ms)",
-                session.entity_id,
-                len(jpeg),
-                diagnostics.first_parsed_ms or 0.0,
-                diagnostics.first_sent_ms or 0.0,
-              )
+            await send_jpeg(jpeg)
             frames_this_process += 1
-            sent += len(jpeg)
           if frame_reader:
             dropped_frames = await frame_reader
         except (ConnectionResetError, BrokenPipeError):

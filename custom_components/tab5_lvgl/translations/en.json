@@ -21,26 +21,52 @@
           "mqtt_username": "MQTT username",
           "mqtt_password": "MQTT password",
           "base_topic": "MQTT base topic",
-          "ha_prefix": "HA entity prefix"
+          "ha_prefix": "HA entity prefix",
+          "panel_password": "Panel Web Admin password (only if set)"
+        },
+        "data_description": {
+          "panel_password": "Leave empty if the panel has no Web Admin password. It is used only for this setup and is not stored."
         }
       },
       "discovery_confirm": {
         "title": "Panel discovered",
         "description": "**{name}** announced itself over MQTT with base topic {base_topic}. Only add it if it is your panel."
+      },
+      "adopt_confirm": {
+        "title": "Link panel",
+        "description": "**{name}** announced itself over MQTT with base topic {base_topic}, which the entry **{entry}** uses. Only link it if it is your panel."
+      },
+      "pairing_confirm": {
+        "title": "Set up encryption",
+        "description": "Encrypts the existing display **{name}**. No new device is added.\n\n# {number}\n\nConfirm only if the display shows this number.",
+        "menu_options": {
+          "pairing_accept": "Numbers match: encrypt",
+          "pairing_reject": "Reject (stays unencrypted)"
+        }
       }
     },
     "error": {
       "topic_already_configured": "A panel with this MQTT topic is already configured.",
       "cannot_connect": "Could not reach the panel. Check that it's still on the network and try again.",
       "mqtt_host_required": "Enter an MQTT host or IP address.",
-      "invalid_port": "Enter a valid MQTT port between 1 and 65535."
+      "invalid_port": "Enter a valid MQTT port between 1 and 65535.",
+      "invalid_panel_password": "The panel rejected the Web Admin password.",
+      "panel_password_required": "The panel's Web Admin is protected by a password. Enter the Web Admin password.",
+      "panel_locked": "Too many wrong passwords. Wait a few minutes and try again.",
+      "panel_identity_failed": "The device could not prove that it is the panel with this password. No credentials were sent."
     },
     "abort": {
       "missing_device_id": "The discovered device did not send a valid identifier.",
       "mqtt_not_configured": "No MQTT integration is set up in Home Assistant. Please set up the MQTT integration first.",
       "unsupported_broker": "The configured MQTT broker requires TLS or a client certificate, which the panel does not support. Please enter the broker credentials manually in the panel's web interface.",
       "mqtt_read_failed": "Could not read the MQTT credentials.",
-      "already_configured": "This panel is already configured."
+      "already_configured": "This panel is already configured.",
+      "panel_linked": "The panel was linked to the existing entry.",
+      "adopt_target_changed": "The entry now belongs to another panel or uses another base topic.",
+      "pairing_done": "Encrypted. The display now sends encrypted commands.",
+      "pairing_confirmed": "Confirmed. Now confirm on the display too.",
+      "pairing_rejected": "Rejected. The display stays connected unencrypted.",
+      "pairing_expired": "This attempt has ended. Tap Encrypt on the display again."
     }
   },
   "options": {
@@ -48,8 +74,10 @@
       "init": {
         "menu_options": {
           "panel": "Panel settings",
-          "entities": "Entity configuration",
-          "energy": "Energy Dashboard"
+          "entities": "Entity configuration (all displays)",
+          "access_codes": "Codes for locks and alarm panels (all displays)",
+          "energy": "Energy Dashboard (all displays)",
+          "security": "Security: {security}"
         }
       },
       "panel": {
@@ -79,8 +107,21 @@
           "scene_map_text": "Action aliases",
           "numbers": "Numbers / number helpers",
           "selects": "Selects / dropdown helpers",
-          "datetimes": "Date / Time / helpers"
+          "datetimes": "Date / Time / helpers",
+          "fans": "Fans",
+          "locks": "Locks",
+          "alarm_panels": "Alarm panels",
+          "open_without_code": "Allow opening without a code"
+        },
+        "data_description": {
+          "locks": "Can only be operated from a paired (encrypted) display with a Web Admin password. Home Assistant checks the code, or the Bridge when one is set under “Codes for locks and alarm panels”.",
+          "alarm_panels": "Can only be operated from a paired (encrypted) display with a Web Admin password. Home Assistant checks the code, or the Bridge when one is set under “Codes for locks and alarm panels”.",
+          "open_without_code": "Warning: anyone at the display can unlock, open or disarm these locks and alarm panels without a code. Only for devices without their own code or with a default code."
         }
+      },
+      "access_codes": {
+        "title": "Codes for locks and alarm panels",
+        "description": "Optional. Many devices ignore a wrong code without reporting an error: Home Assistant then reports success, and the display can show neither “wrong code” nor the lockout after several wrong codes. With a code here, the Bridge checks every code from a display itself and passes only a correct one on to Home Assistant. Separate several codes with commas. Leave it empty when Home Assistant already reports a wrong code. When the code on the device changes, change it here too."
       },
       "energy": {
         "title": "Energy Dashboard",
@@ -90,11 +131,26 @@
           "energy_gas": "Gas",
           "energy_water": "Water"
         }
+      },
+      "security": {
+        "title": "Encryption",
+        "description": "This display is encrypted (key id {key_id}).",
+        "data": {
+          "remove_pairing": "Turn off encryption"
+        }
       }
     },
     "error": {
       "invalid_scene_map": "Aliases must follow the pattern alias=entity_id (one per line).",
-      "invalid_editable_entities": "Choose compatible Number, Select or Date/Time entities."
+      "invalid_editable_entities": "Choose compatible Number, Select or Date/Time entities.",
+      "pairing_nothing_selected": "Nothing changed. Tick the box to turn encryption off.",
+      "invalid_access_codes": "Up to 10 codes separated by commas, each at most 32 characters."
+    },
+    "abort": {
+      "pairing_removed": "Encryption turned off. The display turns it off too when it connects.",
+      "pairing_not_paired": "Not encrypted. To set it up, choose Settings → System → Security → Encrypt on the display.",
+      "pairing_removing": "Encryption is turning off. The display turns it off when it connects.",
+      "no_access_entities": "First select locks or alarm panels under “Entity configuration”."
     }
   },
   "entity": {
@@ -111,6 +167,11 @@
     "switch": {
       "local_camera": {
         "name": "Camera"
+      }
+    },
+    "binary_sensor": {
+      "encryption": {
+        "name": "Encryption"
       }
     }
   },

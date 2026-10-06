@@ -19,26 +19,37 @@ from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import get_url
 
+from .access_helpers import parse_access_codes
 from .binary_sensor_helpers import split_binary_sensor_entities
+from .panel_auth import ERROR_CANNOT_CONNECT, async_push_credentials
+from .capabilities import CAPABILITIES
+from .command_channel import entry_pairing_key, entry_removing_key, key_id_for_key, without_pairing
 from .control_helpers import ACTION_DOMAINS, SWITCH_DOMAINS, build_action_map, entity_domain
 from .editable_helpers import (EDITABLE_LISTS, EDITABLE_DOMAINS, NUMBER_DOMAINS, SELECT_DOMAINS, DATETIME_DOMAINS, editable_selection, domain_of, build_editable_payload, build_editable_service_call, add_number_history, MAX_CONTROL_BYTES)
 from .const import (
   CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES,
+  CONF_ACCESS_CODES,
   CONF_BASE_TOPIC,
   CONF_BINARY_SENSORS,
   CONF_CAMERAS,
+  CONF_ALARM_PANELS,
   CONF_CLIMATES,
+  CONF_COMMAND_PAIRING_REMOVING,
   CONF_COVERS,
   CONF_DEVICE_ID,
   CONF_DEVICE_NAME,
   CONF_ENERGY_ELECTRICITY,
   CONF_ENERGY_GAS,
   CONF_ENERGY_WATER,
+  CONF_FANS,
   CONF_HA_PREFIX,
   CONF_LIGHTS,
+  CONF_LOCAL_IO,
+  CONF_LOCKS,
   CONF_MANUFACTURER,
   CONF_MEDIA_PLAYERS,
   CONF_MODEL,
+  CONF_OPEN_WITHOUT_CODE,
   CONF_SCENE_ENTITIES,
   CONF_SCENE_MAP,
   CONF_SCENE_MAP_TEXT,
@@ -47,7 +58,11 @@ from .const import (
   CONF_WEATHERS,
   DEFAULT_BASE,
   DEFAULT_PREFIX,
+  DISCOVERY_ADOPT_ENTRY,
+  DISCOVERY_PAIRING_ATTEMPT,
+  DISCOVERY_PAIRING_ENTRY,
   DOMAIN,
+  PAIRING_UNIQUE_ID_PREFIX,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +71,34 @@ CONF_PROVISION_MQTT_HOST = "mqtt_host"
 CONF_PROVISION_MQTT_PORT = "mqtt_port"
 CONF_PROVISION_MQTT_USERNAME = "mqtt_username"
 CONF_PROVISION_MQTT_PASSWORD = "mqtt_password"
+# Optional Web Admin password of the panel. Used only for the pairing push and
+# never stored in the config entry or logged.
+CONF_PROVISION_PANEL_PASSWORD = "panel_password"
+# Options step "security": removes the pairing key (CONF_COMMAND_PAIRING).
+CONF_REMOVE_PAIRING = "remove_pairing"
+# Result of the user's answer on a pairing card (pairing.ANSWER_*).
+_PAIRING_RESULTS = {"paired": "pairing_done", "waiting": "pairing_confirmed", "rejected": "pairing_rejected"}
+# State of the pairing in the options menu ("Security: encrypted").
+_SECURITY_STATES = {
+  "de": {"paired": "verschl\u00fcsselt", "removing": "wird ausgeschaltet", "off": "nicht verschl\u00fcsselt"},
+  "en": {"paired": "encrypted", "removing": "turning off", "off": "not encrypted"},
+}
+
+
+def _language(hass: Any) -> str:
+  """Home Assistant's language for texts the Bridge builds itself; English otherwise."""
+  language = str(getattr(hass.config, "language", None) or "en").split("-")[0].lower()
+  return language if language in _SECURITY_STATES else "en"
+
+
+def _security_state(hass: Any, entry: Any) -> str:
+  if entry_pairing_key(entry) is not None:
+    state = "paired"
+  elif entry_removing_key(entry) is not None:
+    state = "removing"
+  else:
+    state = "off"
+  return _SECURITY_STATES[_language(hass)][state]
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +120,11 @@ class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
   _discovered_mqtt_error: Optional[str] = None
   # Panel data announced over MQTT, kept until the user confirms the card.
   _discovered_data: Optional[Dict[str, Any]] = None
+  # Existing entry the announcing panel would be linked to (adopt_confirm).
+  _adopt_entry_id: Optional[str] = None
+  # Pairing card: the entry whose panel asks to pair, and the attempt.
+  _pairing_entry_id: Optional[str] = None
+  _pairing_attempt: Optional[str] = None
 
   def _validate_topic_input(self, user_input: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Normalisiert base_topic/ha_prefix und prueft auf Kollision. Von async_step_user
@@ -145,14 +193,69 @@ class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
   async def async_step_integration_discovery(self, discovery_info: Dict[str, Any]):
     """A panel announced itself over MQTT; ask the user before adding it."""
+    if discovery_info.get(DISCOVERY_PAIRING_ENTRY):
+      return await self._async_start_pairing_card(discovery_info)
     device_id = discovery_info.get(CONF_DEVICE_ID)
     if not device_id:
       return self.async_abort(reason="missing_device_id")
     await self.async_set_unique_id(device_id)
     self._abort_if_unique_id_configured()
     self._discovered_data = dict(discovery_info)
+    self._adopt_entry_id = self._discovered_data.pop(DISCOVERY_ADOPT_ENTRY, None)
     self.context["title_placeholders"] = {"name": _entry_title(self._discovered_data)}
+    if self._adopt_entry_id:
+      return await self.async_step_adopt_confirm()
     return await self.async_step_discovery_confirm()
+
+  def _adoptable_entry(self) -> Optional[config_entries.ConfigEntry]:
+    """The entry the announcing panel asks to be linked to, while still free."""
+    entry = self.hass.config_entries.async_get_entry(self._adopt_entry_id or "")
+    if entry is None or entry.domain != DOMAIN:
+      return None
+    data = self._discovered_data or {}
+    if _entry_base_topic(entry) != data.get(CONF_BASE_TOPIC):
+      return None
+    bound = str(entry.data.get(CONF_DEVICE_ID) or entry.unique_id or "")
+    if bound and not (
+      len(bound) == 14 and bound.startswith("tab5_lvgl_")
+      and str(data.get(CONF_DEVICE_ID) or "").upper().endswith(bound[-4:].upper())
+    ):
+      return None
+    return entry
+
+  async def async_step_adopt_confirm(self, user_input: Dict[str, Any] | None = None):
+    """Link an announcing panel to an existing entry with its base topic.
+
+    Any MQTT client can announce a base topic, so the user confirms before a
+    manually added entry (or one from firmware before v0.3.1) is bound to
+    this panel's device id.
+    """
+    entry = self._adoptable_entry()
+    if entry is None:
+      return self.async_abort(reason="adopt_target_changed")
+    data = dict(self._discovered_data or {})
+    if user_input is not None:
+      self._abort_if_unique_id_configured()
+      new_data = dict(entry.data)
+      new_data[CONF_DEVICE_ID] = data[CONF_DEVICE_ID]
+      for key in (CONF_LOCAL_IO, CAPABILITIES):
+        if key in data:
+          new_data[key] = data[key]
+      _LOGGER.info("HomeTiles Bridge linked device %s to the existing entry", data[CONF_DEVICE_ID])
+      self.hass.config_entries.async_update_entry(
+        entry, data=new_data, title=_entry_title(new_data), unique_id=data[CONF_DEVICE_ID],
+      )
+      await self.hass.config_entries.async_reload(entry.entry_id)
+      return self.async_abort(reason="panel_linked")
+    self._set_confirm_only()
+    return self.async_show_form(
+      step_id="adopt_confirm",
+      description_placeholders={
+        "name": _entry_title(data),
+        "base_topic": data.get(CONF_BASE_TOPIC) or "",
+        "entry": entry.title,
+      },
+    )
 
   async def async_step_discovery_confirm(self, user_input: Dict[str, Any] | None = None):
     data = dict(self._discovered_data or {})
@@ -167,6 +270,64 @@ class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         "base_topic": data.get(CONF_BASE_TOPIC) or "",
       },
     )
+
+  # ---- Pairing card: the panel asks to pair (pairing.py) ----
+
+  def _pairing_bridge(self) -> Any:
+    return self.hass.data.get(DOMAIN, {}).get("entries", {}).get(self._pairing_entry_id or "")
+
+  def _pairing_number(self) -> Optional[str]:
+    bridge = self._pairing_bridge()
+    return bridge.pairing_number(self._pairing_attempt) if bridge is not None else None
+
+  async def _async_start_pairing_card(self, discovery_info: Dict[str, Any]):
+    self._pairing_entry_id = str(discovery_info.get(DISCOVERY_PAIRING_ENTRY))
+    self._pairing_attempt = str(discovery_info.get(DISCOVERY_PAIRING_ATTEMPT) or "")
+    # One card per panel; "Ignore" on it rejects the attempt (async_step_ignore).
+    await self.async_set_unique_id(f"{PAIRING_UNIQUE_ID_PREFIX}{self._pairing_entry_id}")
+    entry = self.hass.config_entries.async_get_entry(self._pairing_entry_id)
+    number = self._pairing_number()
+    if entry is None or number is None:
+      return self.async_abort(reason="pairing_expired")
+    # Short, so the card never cuts the number off; the dialog explains the rest.
+    self.context["title_placeholders"] = {"name": f"{entry.title} ({number})"}
+    return await self.async_step_pairing_confirm()
+
+  async def async_step_pairing_confirm(self, user_input: Dict[str, Any] | None = None):
+    """Show the number; the user compares it with the one on the display."""
+    entry = self.hass.config_entries.async_get_entry(self._pairing_entry_id or "")
+    number = self._pairing_number()
+    if entry is None or number is None:
+      return self.async_abort(reason="pairing_expired")
+    return self.async_show_menu(
+      step_id="pairing_confirm",
+      menu_options=["pairing_accept", "pairing_reject"],
+      description_placeholders={"name": entry.title, "number": number},
+    )
+
+  async def async_step_pairing_accept(self, user_input: Dict[str, Any] | None = None):
+    return await self._async_answer_pairing(True)
+
+  async def async_step_pairing_reject(self, user_input: Dict[str, Any] | None = None):
+    return await self._async_answer_pairing(False)
+
+  async def _async_answer_pairing(self, accept: bool):
+    bridge = self._pairing_bridge()
+    outcome = None
+    if bridge is not None:
+      outcome = await bridge.async_answer_pairing(self._pairing_attempt, accept, self.flow_id)
+    return self.async_abort(reason=_PAIRING_RESULTS.get(outcome, "pairing_expired"))
+
+  async def async_step_ignore(self, user_input: Dict[str, Any]):
+    """Ignoring a pairing card rejects the pairing; other cards are ignored as usual."""
+    unique_id = str(user_input.get("unique_id") or "")
+    if not unique_id.startswith(PAIRING_UNIQUE_ID_PREFIX):
+      return await super().async_step_ignore(user_input)
+    self._pairing_entry_id = unique_id[len(PAIRING_UNIQUE_ID_PREFIX):]
+    bridge = self._pairing_bridge()
+    if bridge is not None:
+      await bridge.async_answer_pairing(None, False)
+    return self.async_abort(reason="pairing_rejected")
 
   async def async_step_zeroconf(self, discovery_info: Any):
     """Panel per mDNS gefunden, BEVOR es MQTT-Zugangsdaten hat (siehe Firmware:
@@ -219,19 +380,20 @@ class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
       errors.update(mqtt_errors)
 
       if not errors:
-        pushed = await _push_credentials_to_device(
+        push_error = await _push_credentials_to_device(
           self.hass,
           self._discovered_host,
           creds,
           topics[CONF_BASE_TOPIC],
           topics[CONF_HA_PREFIX],
+          str(user_input.get(CONF_PROVISION_PANEL_PASSWORD) or ""),
         )
-        if not pushed:
-          _LOGGER.warning("Tab5 LVGL: Zugangsdaten-Push an %s (%s) fehlgeschlagen",
-                           self._discovered_device_id, self._discovered_host)
-          errors["base"] = "cannot_connect"
+        if push_error:
+          _LOGGER.warning("HomeTiles Bridge could not send MQTT credentials to %s (%s): %s",
+                          self._discovered_device_id, self._discovered_host, push_error)
+          errors["base"] = push_error
         else:
-          _LOGGER.info("Tab5 LVGL: Zugangsdaten erfolgreich an %s (%s) gepusht",
+          _LOGGER.info("HomeTiles Bridge sent MQTT credentials to %s (%s)",
                        self._discovered_device_id, self._discovered_host)
           data: Dict[str, Any] = dict(topics)
           data[CONF_DEVICE_ID] = self._discovered_device_id
@@ -258,6 +420,8 @@ class Tab5ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         vol.Optional(CONF_PROVISION_MQTT_PASSWORD, default=mqtt_defaults.get("password", "")): _password_schema(),
         vol.Required(CONF_BASE_TOPIC, default=base_default): str,
         vol.Required(CONF_HA_PREFIX, default=prefix_default): str,
+        # Never prefilled: the panel password is typed for each pairing.
+        vol.Optional(CONF_PROVISION_PANEL_PASSWORD, default=""): _password_schema(),
       }),
       description_placeholders={
         "name": self._discovered_name or self._discovered_device_id or "",
@@ -284,7 +448,8 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
   async def async_step_init(self, user_input: Dict[str, Any] | None = None):
     return self.async_show_menu(
       step_id="init",
-      menu_options=["panel", "entities", "energy"],
+      menu_options=["panel", "entities", "access_codes", "energy", "security"],
+      description_placeholders={"security": _security_state(self.hass, self.config_entry)},
     )
 
   # ---- Section 1: Panel settings ----
@@ -320,6 +485,40 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
       errors=errors,
     )
 
+  # ---- Encrypted panel commands (command_channel.py) ----
+
+  async def async_step_security(self, user_input: Dict[str, Any] | None = None):
+    """Pairing happens on the display (a card shows the number); here it is removed."""
+    stored_key = entry_pairing_key(self.config_entry)
+    if stored_key is None:
+      if entry_removing_key(self.config_entry) is not None:
+        return self.async_abort(reason="pairing_removing")
+      return self.async_abort(reason="pairing_not_paired")
+    errors: Dict[str, str] = {}
+
+    if user_input is not None:
+      if user_input.get(CONF_REMOVE_PAIRING):
+        # The Bridge keeps the key until the panel turned pairing off too:
+        # it sends the panel an unpair as soon as they have a session.
+        updated = without_pairing(self.config_entry.data)
+        updated[CONF_COMMAND_PAIRING_REMOVING] = stored_key.hex()
+        # The update listener reloads the entry with a removing channel.
+        self.hass.config_entries.async_update_entry(
+          self.config_entry, data=updated, options=without_pairing(self.config_entry.options),
+        )
+        return self.async_abort(reason="pairing_removed")
+      # An empty form changes nothing; say so instead of a plain success.
+      errors["base"] = "pairing_nothing_selected"
+
+    return self.async_show_form(
+      step_id="security",
+      data_schema=vol.Schema({
+        vol.Optional(CONF_REMOVE_PAIRING, default=False): bool,
+      }),
+      description_placeholders={"key_id": key_id_for_key(stored_key) or "-"},
+      errors=errors,
+    )
+
   # ---- Section 2: Shared entity configuration ----
 
   async def async_step_entities(self, user_input: Dict[str, Any] | None = None):
@@ -344,6 +543,7 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
           CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES,
           CONF_CLIMATES, CONF_COVERS,
           CONF_MEDIA_PLAYERS, CONF_CAMERAS, CONF_SCENE_MAP, CONF_SCENE_MAP_TEXT,
+          CONF_FANS, CONF_LOCKS, CONF_ALARM_PANELS, CONF_OPEN_WITHOUT_CODE,
         )
         for entry in self.hass.config_entries.async_entries(DOMAIN):
           if entry.entry_id == self.config_entry.entry_id:
@@ -391,6 +591,18 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
         vol.Optional(CONF_COVERS, default=merged.get(CONF_COVERS, [])): selector.EntitySelector(
           selector.EntitySelectorConfig(domain=["cover"], multiple=True)
         ),
+        vol.Optional(CONF_FANS, default=merged.get(CONF_FANS, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=["fan"], multiple=True)
+        ),
+        vol.Optional(CONF_LOCKS, default=merged.get(CONF_LOCKS, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=["lock"], multiple=True)
+        ),
+        vol.Optional(CONF_ALARM_PANELS, default=merged.get(CONF_ALARM_PANELS, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=["alarm_control_panel"], multiple=True)
+        ),
+        vol.Optional(CONF_OPEN_WITHOUT_CODE, default=merged.get(CONF_OPEN_WITHOUT_CODE, [])): selector.EntitySelector(
+          selector.EntitySelectorConfig(domain=["lock", "alarm_control_panel"], multiple=True)
+        ),
         vol.Optional(CONF_CAMERAS, default=merged.get(CONF_CAMERAS, [])): selector.EntitySelector(
           selector.EntitySelectorConfig(domain=["camera"], multiple=True)
         ),
@@ -403,6 +615,49 @@ class Tab5OptionsFlowHandler(config_entries.OptionsFlow):
       }),
       errors=errors,
     )
+
+  # ---- Codes the Bridge checks for locks and alarm panels ----
+
+  async def async_step_access_codes(self, user_input: Dict[str, Any] | None = None):
+    """One masked field per offered lock and alarm panel (all displays).
+
+    A filled field makes the Bridge check every code from a panel itself
+    before Home Assistant gets the command: for devices that ignore a wrong
+    code silently, so "wrong code" and the lockout work there too. An empty
+    field leaves the check to Home Assistant and the device.
+    """
+    current = dict(self.config_entry.data)
+    merged = _merge_all_entities(self.hass, current)
+    entities = _unique(list(merged.get(CONF_LOCKS, [])) + list(merged.get(CONF_ALARM_PANELS, [])))
+    if not entities:
+      return self.async_abort(reason="no_access_entities")
+    stored = dict(current.get(CONF_ACCESS_CODES) or {})
+    errors: Dict[str, str] = {}
+    if user_input is not None:
+      codes: Dict[str, str] = {}
+      for entity_id in entities:
+        try:
+          parsed = parse_access_codes(user_input.get(entity_id))
+        except ValueError:
+          errors[entity_id] = "invalid_access_codes"
+          continue
+        if parsed:
+          codes[entity_id] = ",".join(parsed)
+      if not errors:
+        # Shared by all displays like the entity selection.
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+          other = dict(entry.data or {})
+          other[CONF_ACCESS_CODES] = codes
+          self.hass.config_entries.async_update_entry(entry, data=other)
+        return self.async_create_entry(title="", data={})
+      stored = {key: value for key, value in (user_input or {}).items() if isinstance(value, str)}
+    schema: Dict[Any, Any] = {}
+    for entity_id in entities:
+      # suggested_value, not default: a cleared field must stay empty.
+      schema[vol.Optional(entity_id, description={"suggested_value": stored.get(entity_id, "")})] = (
+        selector.TextSelector(selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD))
+      )
+    return self.async_show_form(step_id="access_codes", data_schema=vol.Schema(schema), errors=errors)
 
   # ---- Section 3: Energy Dashboard ----
 
@@ -481,6 +736,10 @@ def _merge_all_entities(hass, current: Dict[str, Any]) -> Dict[str, Any]:
   all_datetimes = list(current.get(CONF_DATETIMES, []))
   all_covers = list(current.get(CONF_COVERS, []))
   all_cameras = list(current.get(CONF_CAMERAS, []))
+  all_fans = list(current.get(CONF_FANS, []))
+  all_locks = list(current.get(CONF_LOCKS, []))
+  all_alarm_panels = list(current.get(CONF_ALARM_PANELS, []))
+  all_open_without_code = list(current.get(CONF_OPEN_WITHOUT_CODE, []))
   all_scene_ids = list((current.get(CONF_SCENE_MAP) or {}).values())
   scene_map_text = current.get(CONF_SCENE_MAP_TEXT, "")
 
@@ -511,6 +770,10 @@ def _merge_all_entities(hass, current: Dict[str, Any]) -> Dict[str, Any]:
     all_datetimes.extend(list(data.get(CONF_DATETIMES, [])))
     all_covers.extend(list(data.get(CONF_COVERS, [])))
     all_cameras.extend(list(data.get(CONF_CAMERAS, [])))
+    all_fans.extend(list(data.get(CONF_FANS, [])))
+    all_locks.extend(list(data.get(CONF_LOCKS, [])))
+    all_alarm_panels.extend(list(data.get(CONF_ALARM_PANELS, [])))
+    all_open_without_code.extend(list(data.get(CONF_OPEN_WITHOUT_CODE, [])))
     all_scene_ids.extend(list((data.get(CONF_SCENE_MAP) or {}).values()))
 
   return {
@@ -526,6 +789,10 @@ def _merge_all_entities(hass, current: Dict[str, Any]) -> Dict[str, Any]:
     CONF_DATETIMES: _unique(all_datetimes),
     CONF_COVERS: _unique(all_covers),
     CONF_CAMERAS: _unique(all_cameras),
+    CONF_FANS: _unique(all_fans),
+    CONF_LOCKS: _unique(all_locks),
+    CONF_ALARM_PANELS: _unique(all_alarm_panels),
+    CONF_OPEN_WITHOUT_CODE: _unique(all_open_without_code),
     CONF_SCENE_ENTITIES: _unique(all_scene_ids),
     CONF_SCENE_MAP_TEXT: scene_map_text,
   }
@@ -549,6 +816,16 @@ def _convert_entity_data(user_input: Dict[str, Any], current: Dict[str, Any]) ->
   climates = _normalise_entity_list(user_input.get(CONF_CLIMATES, []))
   covers = _normalise_entity_list(user_input.get(CONF_COVERS, []))
   cameras = _normalise_entity_list(user_input.get(CONF_CAMERAS, []))
+  # Lists added after the form's first version keep their stored value when a
+  # submission does not carry them.
+  def selected(key: str, domains: tuple[str, ...]) -> list[str]:
+    values = _normalise_entity_list(user_input.get(key, current.get(key, [])))
+    return [item for item in values if entity_domain(item) in domains]
+
+  fans = selected(CONF_FANS, ("fan",))
+  locks = selected(CONF_LOCKS, ("lock",))
+  alarm_panels = selected(CONF_ALARM_PANELS, ("alarm_control_panel",))
+  open_without_code = selected(CONF_OPEN_WITHOUT_CODE, ("lock", "alarm_control_panel"))
 
   selected_scenes = _normalise_entity_list(user_input.get(CONF_SCENE_ENTITIES, []))
   scene_map_text = user_input.get(CONF_SCENE_MAP_TEXT, "").strip("\n")
@@ -570,6 +847,10 @@ def _convert_entity_data(user_input: Dict[str, Any], current: Dict[str, Any]) ->
     updated[key] = editable_selection(user_input.get(key, current.get(key, [])), domains)
   updated[CONF_COVERS] = covers
   updated[CONF_CAMERAS] = cameras
+  updated[CONF_FANS] = fans
+  updated[CONF_LOCKS] = locks
+  updated[CONF_ALARM_PANELS] = alarm_panels
+  updated[CONF_OPEN_WITHOUT_CODE] = open_without_code
   updated[CONF_SCENE_MAP] = scene_map
   updated[CONF_SCENE_MAP_TEXT] = scene_map_text
   return updated
@@ -848,11 +1129,16 @@ async def _push_credentials_to_device(
   creds: Dict[str, Any],
   base_topic: str,
   ha_prefix: str,
-) -> bool:
-  """Schiebt die Broker-Zugangsdaten per POST /mqtt (bestehender Admin-Endpoint,
-  siehe web_admin_handlers.cpp:handleSaveMQTT) auf das Panel und stoesst danach
-  einen Neustart an (POST /restart) -- ohne den bleibt mqtt_enabled auf dem
-  Boot-Latch stehen und die neuen Zugangsdaten wirken nie (siehe network_manager.cpp)."""
+  panel_password: str = "",
+) -> Optional[str]:
+  """Send the broker credentials with POST /mqtt (Web Admin endpoint, see
+  web_admin_handlers.cpp:handleSaveMQTT) and restart the panel with POST
+  /restart; without the restart mqtt_enabled keeps its boot value and the new
+  credentials never take effect (see network_manager.cpp).
+
+  A panel with the optional Web Admin password is logged in first (see
+  panel_auth.py). Returns None on success or a config flow error code.
+  """
   session = async_get_clientsession(hass)
   timeout = aiohttp.ClientTimeout(total=5)
   form = {
@@ -864,15 +1150,9 @@ async def _push_credentials_to_device(
     "ha_prefix": ha_prefix,
   }
   try:
-    async with session.post(f"http://{device_host}/mqtt", data=form, timeout=timeout, allow_redirects=False) as resp:
-      if resp.status not in (200, 303):
-        return False
-    async with session.post(f"http://{device_host}/restart", data={}, timeout=timeout, allow_redirects=False) as resp:
-      if resp.status not in (200, 303):
-        return False
+    return await async_push_credentials(session, device_host, form, panel_password, timeout)
   except (aiohttp.ClientError, asyncio.TimeoutError):
-    return False
-  return True
+    return ERROR_CANNOT_CONNECT
 
 
 def _entry_title(data: Dict[str, Any]) -> str:

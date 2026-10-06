@@ -12,7 +12,8 @@ This integration is the Home Assistant companion for the **HomeTiles** firmware.
 - Numeric sensor graphs plus bounded binary and textual-state timelines for 24 hours or 7 days
 - Weather forecasts (daily, twice-daily day/night periods, and hourly)
 - Energy dashboard data (consumption, solar, grid, battery, gas, water)
-- Light, switch, cover, climate, media player and scene control from the display
+- Light, switch, cover, climate, media player, fan and scene control from the display
+- Lock and alarm panel control from encrypted displays, with codes checked by Home Assistant or, for devices that ignore wrong codes, by the Bridge
 - Experimental camera popups with local, receiver-paced JPEG video transport
 - Auto-discovery of integration-owned sensors and device-announced local I/O
 
@@ -53,8 +54,13 @@ Detailed instructions: [bridge documentation](https://galusperes.github.io/HomeT
 Configure via the Home Assistant UI:
 
 - **Panel Settings** - MQTT base topic, HA prefix, device metadata
-- **Entity Configuration** - Sensors, binary sensors, weather, lights, switchable entities, covers, climate devices, media players, scenes/scripts/buttons
+- **Entity Configuration** - Sensors, binary sensors, weather, lights, switchable entities, covers, fans, locks, alarm panels, climate devices, media players, scenes/scripts/buttons
 - **Energy Dashboard** - Electricity, gas and water from the HA Energy Dashboard
+- **Security (encrypted commands)** - Optional. Encryption is set up on the display (Settings > System > Security > Encrypt). Home Assistant then shows a card under Discovered with a six-digit number; confirm it there and on the display if both show the same number. The Bridge then runs only encrypted, authenticated commands from that display and sends camera stream tokens encrypted; states and camera images stay unencrypted. A diagnostic sensor "Encryption" shows the state, and Configure > Security turns encryption off again. Without encryption, and with older firmware, everything works unencrypted as before. Protocol: [command-encryption.md](https://github.com/GalusPeres/HomeTiles/blob/main/docs-dev/command-encryption.md)
+
+### Announcements and discovery
+
+Any client on the MQTT broker can publish on the announcement topic, so the Bridge accepts an announcement only under the panel's own `tab5_lvgl/config/{id}/bridge` topic and, for an existing entry, only with that entry's base topic. A panel with encrypted commands signs its announcement; its entry then ignores unsigned or wrongly signed ones. New panels always get a discovery card (at most three waiting, five new panels per ten minutes), and linking a panel to an existing entry that has no panel yet also asks for confirmation. History requests run two at a time and 30 per minute per panel; extra requests wait in line. A numeric graph uses the Recorder statistics where it can and otherwise reads at most 60,480 state rows.
 
 ### Compatible Switch and Scene entities (v0.6.42)
 
@@ -71,11 +77,27 @@ Select the entity in **Entity Configuration**, then assign it to an existing til
 
 Switch-compatible domains appear under **Switches / switchable entities**; lights retain their own selector. Actions appear under **Scenes / Scripts / Buttons**. Fan and Siren require both HA on/off feature flags; an unsupported entity is disabled. The existing on/off popup is used for non-light entities. Fan speed, humidity targets, remote commands/activities and siren tones are outside this tile's controls.
 
-Automation on/off does not trigger its actions immediately. Use an HA script with defaults for actions that need parameters. Read-only `binary_sensor` and `event` entities cannot be switched or pressed. Locks, alarms, vacuums, valves and update entities have different service semantics; Cover, Climate and Media keep their existing dedicated tiles. See HA's [automation actions](https://www.home-assistant.io/docs/automation/services/), [button](https://www.home-assistant.io/integrations/button/), [input button](https://www.home-assistant.io/integrations/input_button/), [fan features](https://developers.home-assistant.io/docs/core/entity/fan/) and [siren features](https://developers.home-assistant.io/docs/core/entity/siren/).
+Automation on/off does not trigger its actions immediately. Use an HA script with defaults for actions that need parameters. Read-only `binary_sensor` and `event` entities cannot be switched or pressed. Vacuums, valves and update entities have different service semantics; Cover, Climate and Media keep their existing dedicated tiles, and locks, alarm panels and fans have their own (see below). See HA's [automation actions](https://www.home-assistant.io/docs/automation/services/), [button](https://www.home-assistant.io/integrations/button/), [input button](https://www.home-assistant.io/integrations/input_button/), [fan features](https://developers.home-assistant.io/docs/core/entity/fan/) and [siren features](https://developers.home-assistant.io/docs/core/entity/siren/).
 
 Existing selections, aliases and topic names remain valid. The new firmware adds translated editor labels and propagates availability through all Switch tiles/popups. Ordinary `switch.*` on/off state payloads retain their legacy format; additional switch domains use the already supported `state`/`available` JSON shape. Unavailable or missing actions are ignored, while never-pressed buttons with an unknown timestamp remain usable. All switch/action commands must resolve to configured entities and use a fixed service allow-list. Retained commands are ignored after restart or reconnect.
 
 Aliases remain stable when you reorder selections or add another domain with the same object name. Custom aliases still use `alias=entity_id` lines. Fresh setup and existing configurations use the same compatible selectors; no new configuration list is required.
+
+### Locks, alarm panels and fans
+
+Select them under **Fans**, **Locks** and **Alarm panels** in the entity configuration. The tiles read a retained JSON state on the additive `ha_prefix/<domain>/<object>/detail` topic; the plain `state` topic keeps its format for older firmware and other tiles.
+
+Locks and alarm panels follow the rules of Home Assistant's own Google Assistant integration for secure devices:
+
+- They can only be operated from a display that is encrypted (paired) and has a Web Admin password; the display confirms the password in every encrypted command. Their commands are accepted only encrypted; there is no plain `cmnd` topic for them.
+- Home Assistant checks every code, exactly as when it is typed in the Home Assistant UI. Locking and arming need a code when the entity requires one; unlocking, opening and disarming always need the entity's code.
+- Many devices ignore a wrong code without an error, so Home Assistant reports success and a display could show neither "wrong code" nor the lockout. For them, enter their codes under **Codes for locks and alarm panels** (comma separated, up to ten per device): the Bridge then checks every code from a display itself, answers a wrong one with `wrong_code` and counts it towards the lockout, and passes only a correct one on to Home Assistant. Leave the field empty for devices whose wrong codes Home Assistant reports. When the code on the device changes, change it there too.
+- Alarmo reports a wrong code with an event (`alarmo_failed_to_arm`, reason `invalid_code`) instead of an error. The Bridge waits up to two seconds for Alarmo's verdict, so Alarmo panels show "wrong code" and the lockout without codes in the Bridge; Alarmo's other refusals, such as open sensors, are reported as a failed command. The wrong-code errors of Total Connect and Elmax are recognised as well.
+- A lock or alarm panel without its own code, or with a default code, can only be unlocked, opened or disarmed without typing a code when it is listed under **Allow opening without a code**. Anyone at the display can then do so.
+- The Bridge never logs or retains a code; it stores only the codes entered under **Codes for locks and alarm panels**, in its Home Assistant configuration. Per entity and display, one command with a code runs at a time and at most ten per minute. After five wrong codes, code entry is blocked for 30 seconds, doubling with every further wrong code up to one hour, and Home Assistant shows a notification. Only a correct code ends the block early.
+- Arming modes follow the entity's supported features; triggering the alarm is not offered.
+
+Fan tiles control on/off, speed, preset, oscillation and direction, each only when the entity supports it. Fans also remain selectable as switchable entities.
 
 ## MQTT Topics
 
@@ -96,8 +118,16 @@ The integration communicates with the display firmware via MQTT:
 | `base_topic/cmnd/climate` | Display > HA | Climate temperature and HVAC mode commands |
 | `base_topic/cmnd/cover` | Display > HA | Cover position, tilt, open, close and stop commands |
 | `base_topic/cmnd/scene` | Display > HA | Scene/script activation or button press |
+| `base_topic/cmnd/fan` | Display > HA | Fan on/off, speed, preset, oscillation and direction commands |
+| `base_topic/stat/lock`, `base_topic/stat/alarm` | HA > Display | Result of an encrypted lock or alarm command (`ok`, `wrong_code`, `locked_out`, `busy`, ...; not retained) |
+| `ha_prefix/<domain>/<object>/detail` | HA > Display | Retained lock, alarm panel and fan tile state |
 | `base_topic/cmnd/camera` | Display > HA | Open or close an experimental camera stream |
 | `base_topic/stat/camera` | HA > Display | Camera stream endpoint, protocol and status |
+| `base_topic/secure/panel` | Display > HA | Encrypted commands, session requests and unpair once encrypted (replaces the `cmnd/*` topics above) |
+| `base_topic/secure/bridge` | HA > Display | Encrypted session answers, camera replies, built-in camera requests and unpair once encrypted |
+| `base_topic/stat/secure` | Display > HA | Retained encryption status (`active` and the public key id; empty when off) |
+| `base_topic/pair/panel` | Display > HA | Encryption setup by number: start, nonce, confirm, abort (not retained) |
+| `base_topic/pair/bridge` | HA > Display | Encryption setup by number: commit, nonce, confirm, abort (not retained) |
 | `base_topic/cmnd/local_camera` | HA > Display | Request one still image from the display's own camera (not retained) |
 | `base_topic/cmnd/local_camera` (`"action":"stream"`) | HA > Display | Start or keep alive the live stream (not retained): `{"v":1,"action":"stream","session":"<32 hex>","host":"<Bridge IPv4>","port":8124,"token":"<32 hex>","width":640,"height":360,"fps":15,"quality":65,"ttl_ms":6000}`, re-sent every 2 s while viewers exist |
 | `base_topic/cmnd/local_camera` (`"action":"stream_stop"`) | HA > Display | Stop the live stream (not retained): `{"v":1,"action":"stream_stop","session":"<32 hex>"}` |

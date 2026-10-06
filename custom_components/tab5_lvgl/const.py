@@ -12,6 +12,21 @@ CONF_MANUFACTURER = "manufacturer"
 CONF_MODEL = "model"
 CONF_DEVICE_NAME = "device_name"
 CONF_LOCAL_IO = "local_io"
+# Pairing key (hex) of the encrypted command channel (pairing.py,
+# command_channel.py); absent means unencrypted commands exactly as before.
+CONF_COMMAND_PAIRING = "command_pairing_key"
+# A key removed in Home Assistant, kept until the panel turned pairing off
+# as well (command_channel.py sends it an unpair).
+CONF_COMMAND_PAIRING_REMOVING = "command_pairing_removing"
+# Discovery data keys of a pairing card: the entry whose panel asks to pair
+# and the attempt (config_flow.async_step_pairing_confirm).
+DISCOVERY_PAIRING_ENTRY = "pairing_entry_id"
+DISCOVERY_PAIRING_ATTEMPT = "pairing_attempt"
+# Unique id of a pairing card; one per entry at a time.
+PAIRING_UNIQUE_ID_PREFIX = "pairing_"
+# Discovery data key: the existing entry a newly announcing panel would be
+# linked to once the user confirms (config_flow.async_step_adopt_confirm).
+DISCOVERY_ADOPT_ENTRY = "adopt_entry_id"
 
 CONF_ENERGY_ELECTRICITY = "energy_electricity"
 CONF_ENERGY_GAS = "energy_gas"
@@ -26,6 +41,17 @@ CONF_MEDIA_PLAYERS = "media_players"
 CONF_CLIMATES = "climates"
 CONF_COVERS = "covers"
 CONF_CAMERAS = "cameras"
+CONF_LOCKS = "locks"
+CONF_ALARM_PANELS = "alarm_panels"
+CONF_FANS = "fans"
+# Locks and alarm panels that may be unlocked, opened or disarmed from a panel
+# without a code Home Assistant checks (only settable in the Bridge options).
+CONF_OPEN_WITHOUT_CODE = "open_without_code"
+# Codes the Bridge itself checks for a lock or alarm panel, entity_id ->
+# "1234,5678" (Bridge options): for devices that ignore a wrong code without
+# an error, so Home Assistant answers ok and the panel could show neither
+# "wrong code" nor the lockout.
+CONF_ACCESS_CODES = "access_codes"
 
 DEFAULT_BASE = "hometiles"
 DEFAULT_PREFIX = "ha/statestream"

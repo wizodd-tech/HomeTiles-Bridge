@@ -18,14 +18,11 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components import mqtt
 from homeassistant.components import network as ha_network
+from homeassistant.components import persistent_notification
 from homeassistant.components.weather import WeatherEntityFeature
 from homeassistant.components.weather.const import DATA_COMPONENT as WEATHER_DATA_COMPONENT
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.components.recorder import get_instance
-try:
-  from homeassistant.components.recorder.history import get_significant_states
-except ImportError:  # pragma: no cover - older HA fallback
-  get_significant_states = None
 try:
   from homeassistant.components.recorder.history import get_last_state_changes
 except ImportError:  # pragma: no cover - older HA fallback
@@ -38,6 +35,14 @@ try:
   from homeassistant.components.recorder.statistics import statistics_during_period
 except ImportError:  # pragma: no cover - older HA fallback
   statistics_during_period = None
+try:
+  from homeassistant.components.recorder.statistics import (
+    get_display_unit as get_statistics_display_unit,
+    get_metadata as get_statistics_metadata,
+  )
+except ImportError:  # pragma: no cover - older HA fallback
+  get_statistics_display_unit = None
+  get_statistics_metadata = None
 try:
   from homeassistant.components.energy.data import async_get_manager as async_get_energy_manager
 except ImportError:  # pragma: no cover - energy component not available
@@ -57,6 +62,7 @@ from homeassistant.helpers import discovery_flow
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.sun import get_astral_event_date
 try:
   from homeassistant.helpers.icon import icon_for_entity
 except Exception:  # pragma: no cover - optional fallback
@@ -111,6 +117,7 @@ from .const import (
   CONF_BASE_TOPIC,
   CONF_BINARY_SENSORS,
   CONF_CAMERAS,
+  CONF_ALARM_PANELS,
   CONF_CLIMATES,
   CONF_COVERS,
   CONF_DEVICE_ID,
@@ -118,12 +125,16 @@ from .const import (
   CONF_ENERGY_ELECTRICITY,
   CONF_ENERGY_GAS,
   CONF_ENERGY_WATER,
+  CONF_FANS,
   CONF_HA_PREFIX,
   CONF_LIGHTS,
   CONF_LOCAL_IO,
+  CONF_LOCKS,
   CONF_MANUFACTURER,
   CONF_MEDIA_PLAYERS,
   CONF_MODEL,
+  CONF_OPEN_WITHOUT_CODE,
+  CONF_ACCESS_CODES,
   CONF_SCENE_MAP,
   CONF_SENSORS,
   CONF_SWITCHES,
@@ -131,12 +142,16 @@ from .const import (
   CONFIG_TOPIC_ROOT,
   CONFIG_TOPIC_SUB,
   DEFAULT_BASE,
+  DISCOVERY_ADOPT_ENTRY,
+  DISCOVERY_PAIRING_ATTEMPT,
+  DISCOVERY_PAIRING_ENTRY,
   DEFAULT_PREFIX,
   DOMAIN,
   ENERGY_REQUEST_SUFFIX,
   ENERGY_RESPONSE_SUFFIX,
   HISTORY_REQUEST_SUFFIX,
   HISTORY_RESPONSE_SUFFIX,
+  PAIRING_UNIQUE_ID_PREFIX,
   SERVICE_PUBLISH_SNAPSHOT,
   WEATHER_REQUEST_SUFFIX,
 )
@@ -151,6 +166,35 @@ from .climate_helpers import (
   build_climate_service_call,
   build_climate_state_payload,
 )
+from .access_helpers import (
+  ALARM_DOMAIN,
+  COMMAND_WINDOW_S as ACCESS_COMMAND_WINDOW_S,
+  LOCK_DOMAIN,
+  STATUS_CODE_REQUIRED,
+  STATUS_FAILED,
+  STATUS_LOCKED_OUT,
+  STATUS_NOT_ALLOWED,
+  STATUS_NOT_SECURED,
+  STATUS_OK,
+  STATUS_PENDING,
+  STATUS_WRONG_CODE,
+  ALARMO_EVENT_FAILED,
+  ALARMO_EVENT_SUCCESS,
+  ALARMO_PLATFORM,
+  AccessError,
+  AlarmoRejected,
+  AnsweredAccessError,
+  CodeGuard,
+  access_code_matches,
+  build_access_detail,
+  classify_service_error,
+  default_code_usable,
+  parse_access_codes,
+  parse_access_command,
+  plan_access_call,
+)
+from .fan_helpers import FAN_DOMAIN, build_fan_detail, build_fan_service_call, parse_fan_command
+from .media_artwork import ArtworkClearGate
 from .camera_stream import (
   CAMERA_BRIDGE_PROTOCOL_VERSION,
   CAMERA_STREAM_FPS,
@@ -169,7 +213,29 @@ from .capabilities import (
   stale_internal_sensor,
   stale_local_camera,
 )
-from .local_camera import is_local_camera_self_loop
+from .command_channel import (
+  BridgeChannel,
+  Keys as CommandKeys,
+  entry_pairing_key,
+  entry_removing_key,
+  has_legacy_code,
+  parse_status as parse_command_status,
+  status_topic as command_status_topic,
+  with_pairing_key,
+  without_pairing,
+)
+from .pairing import PanelPairing
+from .announcement_guard import (
+  DiscoveryLimiter,
+  MAX_ANNOUNCEMENT_BYTES,
+  SIGNATURE_VALID,
+  announcement_matches_topic,
+  check_signature,
+)
+from .local_camera import is_local_camera_self_loop, local_camera_command_topic
+from .numeric_history import fetch_numeric_history_values
+from .request_limits import RequestGate
+from .sun_times import sun_days, sun_entries
 from .local_io import (
   LOCAL_IO_RELAY,
   LOCAL_IO_TEMPERATURE,
@@ -193,6 +259,13 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["light", "select", "switch", "sensor", "binary_sensor", "camera"]
 
 MEDIA_COVER_MAX_BYTES = 14000
+# Home Assistant sends SUBSCRIBE packets batched, a moment after async_subscribe
+# returns. The start rekey waits so the panel's hello finds the subscription.
+SECURE_START_REKEY_DELAY_S = 3.0
+# A running pairing attempt times out and repeats the Bridge's confirm.
+PAIRING_TICK_S = 1.0
+# Panel history requests are a few hundred bytes of JSON.
+HISTORY_REQUEST_MAX_BYTES = 2048
 # Source covers from HA media_player_proxy can be 200-500 KB (HD album art).
 # Pillow prepares one 240x240 cover for both the compact tile and the larger
 # popup. Older firmware accepts the same payload fields and JPEG format and
@@ -202,6 +275,12 @@ MEDIA_COVER_CACHE_MAX = 24
 MEDIA_COVER_THUMBNAIL_SIZE = 240
 MEDIA_COVER_WARNING_INTERVAL_SECONDS = 15 * 60
 MEDIA_COVER_WARNING_MAX_KEYS = 64
+# A Lock/Alarm service call that has not finished after this time is answered
+# "pending"; it keeps running and the panel follows the entity state.
+ACCESS_SERVICE_TIMEOUT_S = 10.0
+# Alarmo's verdict on a code follows its service at once; at most this long.
+ALARMO_EVENT_WAIT_S = 2.0
+ACCESS_SEEN_MAX = 128
 
 
 def _is_png_payload(data: bytes) -> bool:
@@ -394,12 +473,24 @@ async def async_setup(hass: HomeAssistant, config: Dict[str, Any]) -> bool:
     )
 
   async def _handle_bridge_config(msg: ReceiveMessage) -> None:
-    try:
-      payload = json.loads(msg.payload)
-    except (ValueError, TypeError):
-      _LOGGER.warning("Tab5 LVGL: Ungültige Bridge-Konfiguration erhalten: %s", msg.payload)
+    raw_payload = msg.payload
+    if not raw_payload:
+      return  # A cleared retained announcement.
+    if len(raw_payload) > MAX_ANNOUNCEMENT_BYTES:
+      if _announcement_log_due(hass, "oversized"):
+        _LOGGER.warning("HomeTiles Bridge ignored an oversized announcement on %s", msg.topic)
       return
-    await _async_process_bridge_config(hass, payload)
+    try:
+      payload = json.loads(raw_payload)
+    except (ValueError, TypeError):
+      if _announcement_log_due(hass, "invalid"):
+        _LOGGER.warning("HomeTiles Bridge ignored an invalid announcement on %s", msg.topic)
+      return
+    if not isinstance(payload, dict):
+      return
+    await _async_process_bridge_config(
+      hass, payload, topic=msg.topic, raw_payload=raw_payload,
+    )
 
   if "_config_unsub" not in domain_data:
     domain_data["_config_unsub"] = await mqtt.async_subscribe(
@@ -436,6 +527,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.config_entries.async_update_entry(entry, title=dev_info["name"])
   _remove_stale_local_io_entities(hass, entry)
   _migrate_local_io_entity_ids(hass, entry)
+  if has_legacy_code(entry):
+    # v0.7.1b1/b2 stored a typed pairing code. Pairing now compares a number,
+    # and the firmware drops its old record too, so both run unencrypted.
+    _LOGGER.warning(
+      "HomeTiles Bridge removed the old pairing code of %s; set up encryption on the display again "
+      "(Settings > System > Security > Encrypt)", entry.title,
+    )
+    hass.config_entries.async_update_entry(
+      entry, data=without_pairing(entry.data), options=without_pairing(entry.options),
+    )
   bridge = Tab5Bridge(hass, entry)
   await bridge.async_setup()
   hass.data[DOMAIN]["entries"][entry.entry_id] = bridge
@@ -1010,6 +1111,18 @@ def _resolve_bridge(hass: HomeAssistant, entry_id: Optional[str]) -> Optional["T
   return next(iter(entries.values()))
 
 
+class _OpenedCommand:
+  """A decrypted panel command, shaped like the MQTT message the handlers read."""
+
+  __slots__ = ("topic", "payload", "qos", "retain")
+
+  def __init__(self, topic: str, payload: str) -> None:
+    self.topic = topic
+    self.payload = payload
+    self.qos = 0
+    self.retain = False
+
+
 class Tab5Bridge:
   """Copies Home Assistant state to the Tab5 MQTT topics."""
 
@@ -1051,10 +1164,20 @@ class Tab5Bridge:
     self.datetimes = editable_selection(data.get(CONF_DATETIMES, []), EDITABLE_LISTS["datetimes"])
     self.covers: List[str] = _unique_entities(list(data.get(CONF_COVERS, [])))
     self.cameras: List[str] = _unique_entities(list(data.get(CONF_CAMERAS, [])))
+    self.locks: List[str] = _unique_entities(list(data.get(CONF_LOCKS, [])))
+    self.alarm_panels: List[str] = _unique_entities(list(data.get(CONF_ALARM_PANELS, [])))
+    self.fans: List[str] = _unique_entities(list(data.get(CONF_FANS, [])))
+    # Locks and alarm panels that may be unlocked/opened/disarmed without a
+    # code Home Assistant checks (access_helpers.plan_access_call).
+    self.open_without_code: List[str] = _unique_entities(list(data.get(CONF_OPEN_WITHOUT_CODE, [])))
+    # Codes the Bridge checks itself per lock or alarm panel (options).
+    self.access_codes: Dict[str, List[str]] = _access_codes_of(data)
     self.tracked_entities: List[str] = []
     self._media_cover_cache: Dict[str, Dict[str, Any]] = {}
     self._media_cover_warning_last: Dict[Tuple[str, str], float] = {}
     self._media_publish_generation: Dict[str, int] = {}
+    self._media_artwork_gate = ArtworkClearGate()
+    self._media_artwork_timers: Dict[str, Any] = {}
     self.scene_map: Dict[str, str] = {
       (alias or "").lower(): entity
       for alias, entity in (data.get(CONF_SCENE_MAP, {}) or {}).items()
@@ -1090,6 +1213,32 @@ class Tab5Bridge:
     self._unsub_climate = None
     self._unsub_cover = None
     self._unsub_camera = None
+    self._unsub_fan = None
+    # Lock/Alarm command ids within their deadline (replay guard). The code
+    # guard of this panel lives in hass.data (_code_guard).
+    self._access_seen: Dict[str, float] = {}
+    self._unsub_secure = None
+    self._unsub_secure_status = None
+    # Encrypted panel commands (command_channel.py); None keeps the plain
+    # command topics exactly as before. A key removed in Home Assistant keeps
+    # a "removing" channel until the panel confirmed that it turned pairing off.
+    self._command_channel: Optional[BridgeChannel] = None
+    pairing_key = entry_pairing_key(entry)
+    removing_key = entry_removing_key(entry)
+    if pairing_key or removing_key:
+      self._command_channel = BridgeChannel(
+        pairing_key or removing_key, self.base_topic, clock=monotonic, removing=not pairing_key,
+      )
+    self._unsub_start_rekey = None
+    # Pairing by number (pairing.py). Its state outlives a reload of the
+    # entry, which storing the key causes.
+    self._pairing = _panel_pairing(self.hass, entry.entry_id, self.base_topic)
+    self._unsub_pair = None
+    self._unsub_pairing_tick = None
+    self._answering_flow_id: Optional[str] = None
+    self.command_status: Dict[str, Any] = {"state": "unknown", "kid": None}
+    self._secure_log_at: Dict[str, float] = {}
+    self._history_gate = RequestGate(monotonic)
     self._unsub_request = None
     self._unsub_history = None
     self._unsub_weather = None
@@ -1162,6 +1311,11 @@ class Tab5Bridge:
     all_covers: List[str] = []
     all_cameras: List[str] = []
     all_weathers: List[str] = []
+    all_locks: List[str] = []
+    all_alarm_panels: List[str] = []
+    all_fans: List[str] = []
+    all_open_without_code: List[str] = []
+    all_access_codes: Dict[str, List[str]] = {}
     all_scene_map: Dict[str, str] = {}
     for entry in self.hass.config_entries.async_entries(DOMAIN):
       data = dict(entry.data or {})
@@ -1190,6 +1344,12 @@ class Tab5Bridge:
       all_datetimes.extend(editable_selection(data.get(CONF_DATETIMES, []), EDITABLE_LISTS["datetimes"]))
       all_covers.extend(list(data.get(CONF_COVERS, [])))
       all_cameras.extend(list(data.get(CONF_CAMERAS, [])))
+      all_locks.extend(list(data.get(CONF_LOCKS, [])))
+      all_alarm_panels.extend(list(data.get(CONF_ALARM_PANELS, [])))
+      all_fans.extend(list(data.get(CONF_FANS, [])))
+      all_open_without_code.extend(list(data.get(CONF_OPEN_WITHOUT_CODE, [])))
+      for entity_id, codes in _access_codes_of(data).items():
+        all_access_codes.setdefault(entity_id, codes)
       all_weathers.extend(weathers)
       for alias, entity in (data.get(CONF_SCENE_MAP, {}) or {}).items():
         if alias and entity:
@@ -1207,6 +1367,13 @@ class Tab5Bridge:
       "covers": _unique_entities(all_covers),
       "cameras": _unique_entities(all_cameras),
       "weathers": _unique_entities(all_weathers),
+      "locks": [item for item in _unique_entities(all_locks) if entity_domain(item) == LOCK_DOMAIN],
+      "alarm_panels": [
+        item for item in _unique_entities(all_alarm_panels) if entity_domain(item) == ALARM_DOMAIN
+      ],
+      "fans": [item for item in _unique_entities(all_fans) if entity_domain(item) == FAN_DOMAIN],
+      "open_without_code": _unique_entities(all_open_without_code),
+      "access_codes": all_access_codes,
       "scene_map": all_scene_map,
     }
 
@@ -1234,6 +1401,11 @@ class Tab5Bridge:
     self.covers = merged["covers"]
     self.cameras = merged["cameras"]
     self.weathers = merged["weathers"]
+    self.locks = merged["locks"]
+    self.alarm_panels = merged["alarm_panels"]
+    self.fans = merged["fans"]
+    self.open_without_code = merged["open_without_code"]
+    self.access_codes = merged["access_codes"]
     self.scene_map = dict(merged["scene_map"])
     self.tracked_entities = _unique_entities(
       self.sensors
@@ -1247,6 +1419,9 @@ class Tab5Bridge:
       + self.datetimes
       + self.covers
       + self.weathers
+      + self.locks
+      + self.alarm_panels
+      + self.fans
       + list(self.scene_map.values())
     )
     if self._runtime_setup_complete and tuple(self.tracked_entities) != previous_tracked:
@@ -1276,6 +1451,36 @@ class Tab5Bridge:
       f"{self.base_topic}/stat/ip",
       self._async_handle_ip,
     )
+    self._unsub_secure_status = await mqtt.async_subscribe(
+      self.hass,
+      command_status_topic(self.base_topic),
+      self._async_handle_secure_status,
+    )
+    # Every panel may ask to pair; firmware without pairing never does.
+    self._unsub_pair = await mqtt.async_subscribe(
+      self.hass,
+      self._pairing.panel_topic,
+      self._async_handle_pair_message,
+    )
+    self._schedule_pairing_tick()
+    channel = self._command_channel
+    if channel is not None:
+      await self._async_setup_secure_commands()
+    # While the pairing is being removed, plain commands work again.
+    if channel is None or channel.removing:
+      await self._async_setup_plain_commands()
+
+    if self.tracked_entities:
+      self._unsub_state = async_track_state_change_event(
+        self.hass,
+        self.tracked_entities,
+        self._handle_state_event,
+      )
+    self._runtime_setup_complete = True
+    await self._async_setup_requests()
+
+  async def _async_setup_plain_commands(self) -> None:
+    """Subscribe the unencrypted command topics of an unpaired panel."""
     self._unsub_scene = await mqtt.async_subscribe(
       self.hass,
       f"{self.base_topic}/cmnd/scene",
@@ -1321,18 +1526,48 @@ class Tab5Bridge:
       self._async_handle_camera_command,
     )
 
-    if self.tracked_entities:
-      self._unsub_state = async_track_state_change_event(
-        self.hass,
-        self.tracked_entities,
-        self._handle_state_event,
-      )
-    self._runtime_setup_complete = True
+    self._unsub_fan = await mqtt.async_subscribe(
+      self.hass,
+      f"{self.base_topic}/cmnd/fan",
+      self._async_handle_fan_command,
+    )
+    # Lock and Alarm commands have no plain topic: they are accepted only
+    # sealed from a paired panel (_command_handlers, _access_secured).
 
+  async def _async_setup_secure_commands(self) -> None:
+    """A paired panel sends its commands only sealed on {base}/secure/panel.
+
+    The plain command topics stay unsubscribed, so a forged unencrypted
+    command is never executed. The rekey asks the panel for a new session,
+    because a restarted Bridge no longer knows the previous one. While the
+    pairing is being removed, the session only carries the unpair.
+    """
+    channel = self._command_channel
+    self._unsub_secure = await mqtt.async_subscribe(
+      self.hass,
+      channel.panel_topic,
+      self._async_handle_secure_panel_message,
+    )
+    self._unsub_start_rekey = async_call_later(
+      self.hass, SECURE_START_REKEY_DELAY_S, self._async_send_start_rekey,
+    )
+    if channel.removing:
+      _LOGGER.info(
+        "HomeTiles encryption of %s turned off; waiting for the panel to turn it off too (key id %s)",
+        self.base_topic, channel.keys.key_id,
+      )
+      return
+    _LOGGER.info(
+      "HomeTiles encrypted commands enabled for %s (key id %s)",
+      self.base_topic, channel.keys.key_id,
+    )
+
+  async def _async_setup_requests(self) -> None:
+    """Prime the icon cache and subscribe the panel's request topics."""
     self._prime_icon_cache()
 
     _LOGGER.info(
-      "Tab5 MQTT bridge ready (device=%s, base=%s, ha_prefix=%s, sensors=%d, lights=%d, switches=%d, media=%d, climate=%d, covers=%d, cameras=%d)",
+      "Tab5 MQTT bridge ready (device=%s, base=%s, ha_prefix=%s, sensors=%d, lights=%d, switches=%d, media=%d, climate=%d, covers=%d, cameras=%d, locks=%d, alarm panels=%d, fans=%d)",
       self.device_id or "n/a",
       self.base_topic,
       self.ha_prefix,
@@ -1343,6 +1578,9 @@ class Tab5Bridge:
       len(self.climates),
       len(self.covers),
       len(self.cameras),
+      len(self.locks),
+      len(self.alarm_panels),
+      len(self.fans),
     )
     if self.config_topic:
       request_topic = f"{CONFIG_TOPIC_ROOT}/{self.device_id}/bridge/request"
@@ -1356,7 +1594,7 @@ class Tab5Bridge:
       self._unsub_history = await mqtt.async_subscribe(
         self.hass,
         self.history_request_topic,
-        self._async_handle_history_request,
+        self._async_on_history_request,
       )
       _LOGGER.debug("Tab5 subscribed to history topic %s", self.history_request_topic)
     if self.weather_request_topic:
@@ -1421,6 +1659,24 @@ class Tab5Bridge:
     if self._unsub_camera:
       self._unsub_camera()
       self._unsub_camera = None
+    if self._unsub_fan:
+      self._unsub_fan()
+      self._unsub_fan = None
+    if self._unsub_start_rekey:
+      self._unsub_start_rekey()
+      self._unsub_start_rekey = None
+    if self._unsub_pair:
+      self._unsub_pair()
+      self._unsub_pair = None
+    if self._unsub_pairing_tick:
+      self._unsub_pairing_tick()
+      self._unsub_pairing_tick = None
+    if self._unsub_secure:
+      self._unsub_secure()
+      self._unsub_secure = None
+    if self._unsub_secure_status:
+      self._unsub_secure_status()
+      self._unsub_secure_status = None
     camera_stream_manager = self.hass.data.get(DOMAIN, {}).get("camera_stream_manager")
     if camera_stream_manager and self.device_id:
       await camera_stream_manager.async_stop_device(self.device_id)
@@ -1444,6 +1700,9 @@ class Tab5Bridge:
     if self._icon_refresh_handle:
       self._icon_refresh_handle()
       self._icon_refresh_handle = None
+    for unsub in getattr(self, "_media_artwork_timers", {}).values():
+      unsub()
+    self._media_artwork_timers = {}
 
   async def async_publish_config_to_device(self, *, force: bool = False) -> None:
     """Publish retained config when its stable metadata changed.
@@ -1484,6 +1743,12 @@ class Tab5Bridge:
           "editable_meta": self._build_entity_meta(self.numbers + self.selects + self.datetimes),
           CONF_CAMERAS: self.cameras,
           "camera_meta": self._build_entity_meta(self.cameras),
+          CONF_LOCKS: self.locks,
+          "lock_meta": self._build_entity_meta(self.locks),
+          CONF_ALARM_PANELS: self.alarm_panels,
+          "alarm_panel_meta": self._build_entity_meta(self.alarm_panels),
+          CONF_FANS: self.fans,
+          "fan_meta": self._build_entity_meta(self.fans),
           "scene_meta": self._build_scene_meta(),
           "scene_map": self.scene_map,
       }
@@ -1524,6 +1789,8 @@ class Tab5Bridge:
 
   async def async_publish_snapshot(self) -> None:
     """Push all configured entities to MQTT."""
+    # Lock, Alarm and Fan tiles also read the additive detail topic.
+    detail_entities = getattr(self, "locks", []) + getattr(self, "alarm_panels", []) + getattr(self, "fans", [])
     for entity_id in self.tracked_entities:
       state = self.hass.states.get(entity_id)
       if entity_id in getattr(self, "numbers", []) + getattr(self, "selects", []) + getattr(self, "datetimes", []) and not state:
@@ -1533,6 +1800,8 @@ class Tab5Bridge:
           await self._async_publish_binary_sensor_absent_state(entity_id)
         elif entity_id in self.switches:
           await self._async_publish_switch_absent_state(entity_id)
+        if entity_id in detail_entities:
+          await self._async_publish_detail_state(entity_id, None)
         continue
       await self._async_publish_entity_state(entity_id, state)
 
@@ -1556,6 +1825,288 @@ class Tab5Bridge:
     # An additive topic preserves plain state payloads consumed by old firmware.
     await mqtt.async_publish(self.hass, self._ha_topic_for_entity(entity_id, "control"),
                              payload, qos=0, retain=True)
+
+  def _has_default_code(self, entity_id: str, attributes: Any) -> bool:
+    """Whether Home Assistant would fill in a usable default code.
+
+    The default code is only compared here; it is never logged or sent.
+    """
+    registry_entry = er.async_get(self.hass).async_get(entity_id)
+    options = getattr(registry_entry, "options", None) or {}
+    domain = entity_domain(entity_id)
+    domain_options = options.get(domain) or {}
+    return default_code_usable(
+      domain, (attributes or {}).get("code_format"), domain_options.get("default_code"),
+    )
+
+  def _code_guard(self) -> CodeGuard:
+    """This panel's code guard; kept in hass.data so an entry reload cannot reset it."""
+    guards = self.hass.data.setdefault(DOMAIN, {}).setdefault("_code_guards", {})
+    guard = guards.get(self.entry.entry_id)
+    if guard is None:
+      guard = guards[self.entry.entry_id] = CodeGuard(monotonic)
+    return guard
+
+  def _detail_payload(self, entity_id: str, state: Optional[State]) -> Dict[str, Any]:
+    domain = entity_domain(entity_id)
+    value = state.state if state is not None else None
+    attributes = state.attributes if state is not None else {}
+    if domain == FAN_DOMAIN:
+      return build_fan_detail(value, attributes)
+    return build_access_detail(
+      domain, value, attributes,
+      has_default_code=self._has_default_code(entity_id, attributes),
+      allowed_without_code=entity_id in self.open_without_code,
+    )
+
+  async def _async_publish_detail_state(self, entity_id: str, state: Optional[State]) -> None:
+    """Lock, Alarm and Fan tile state on the additive retained detail topic.
+
+    The plain state topic keeps its established format for older firmware and
+    other tile types showing the same entity.
+    """
+    if not self._owns_state_publish(entity_id):
+      return
+    payload = json.dumps(
+      self._detail_payload(entity_id, state), ensure_ascii=False, separators=(",", ":"),
+    )
+    await mqtt.async_publish(
+      self.hass, self._ha_topic_for_entity(entity_id, "detail"), payload, qos=0, retain=True,
+    )
+
+  def _access_secured(self, msg: Any, command: Dict[str, Any]) -> bool:
+    """Lock and Alarm need a sealed command from a paired panel with a Web Admin password.
+
+    The panel states its password in the sealed command itself, so the claim
+    is authenticated and fresh (a retained announcement could be stale).
+    """
+    channel = self._command_channel
+    return (
+      isinstance(msg, _OpenedCommand)
+      and channel is not None
+      and not channel.removing
+      and command.get("web_auth") is True
+    )
+
+  async def _async_publish_access_result(
+    self, leaf: str, entity_id: str, command_id: str, status: str, retry_after: int = 0,
+  ) -> None:
+    result: Dict[str, Any] = {"entity_id": entity_id, "id": command_id, "status": status}
+    if retry_after > 0:
+      result["retry_after"] = int(retry_after)
+    await mqtt.async_publish(
+      self.hass, f"{self.base_topic}/stat/{leaf}",
+      json.dumps(result, separators=(",", ":")), qos=0, retain=False,
+    )
+
+  def _notify_code_lockout(self, entity_id: str, seconds: int) -> None:
+    state = self.hass.states.get(entity_id)
+    name = state.name if state is not None and state.name else entity_id
+    wait = f"{seconds} seconds" if seconds < 120 else f"{round(seconds / 60)} minutes"
+    persistent_notification.async_create(
+      self.hass,
+      f"Several wrong codes were entered for {name} on the display {self.entry.title}. "
+      f"Code entry for it is blocked there for {wait}.",
+      title="HomeTiles Bridge",
+      notification_id=f"{DOMAIN}_{self.entry.entry_id}_code_{entity_id}",
+    )
+
+  async def _async_handle_lock_command(self, msg: Any) -> None:
+    await self._async_handle_access_command(LOCK_DOMAIN, msg)
+
+  async def _async_handle_alarm_command(self, msg: Any) -> None:
+    await self._async_handle_access_command(ALARM_DOMAIN, msg)
+
+  async def _async_handle_access_command(self, domain: str, msg: Any) -> None:
+    """Run a Lock or Alarm command and answer on {base}/stat/<leaf>.
+
+    The payload may carry a code: it is never logged, stored or retained, and
+    no log line below includes the payload.
+    """
+    if getattr(msg, "retain", False):
+      return
+    leaf = "lock" if domain == LOCK_DOMAIN else "alarm"
+    now = dt_util.utcnow().timestamp()
+    try:
+      command = parse_access_command(msg.payload, now)
+    except AnsweredAccessError as err:
+      await self._async_publish_access_result(leaf, err.entity_id, err.command_id, err.status)
+      return
+    except AccessError:
+      if self._secure_log_due(f"{leaf}_malformed"):
+        _LOGGER.warning("HomeTiles %s command for %s ignored (malformed)", leaf, self.base_topic)
+      return
+    entity_id, command_id = command["entity_id"], command["id"]
+
+    self._access_seen = {key: expiry for key, expiry in self._access_seen.items() if expiry > now}
+    if command_id in self._access_seen or len(self._access_seen) >= ACCESS_SEEN_MAX:
+      return
+    self._access_seen[command_id] = now + ACCESS_COMMAND_WINDOW_S
+
+    async def answer(status: str, retry_after: int = 0) -> None:
+      await self._async_publish_access_result(leaf, entity_id, command_id, status, retry_after)
+
+    if not self._access_secured(msg, command):
+      if self._secure_log_due(f"{leaf}_not_secured"):
+        _LOGGER.warning(
+          "HomeTiles %s command for %s refused: the panel needs encryption and a Web Admin password",
+          leaf, self.base_topic,
+        )
+      await answer(STATUS_NOT_SECURED)
+      return
+    candidates = self.locks if domain == LOCK_DOMAIN else self.alarm_panels
+    if entity_id not in candidates or entity_domain(entity_id) != domain:
+      await answer(STATUS_NOT_ALLOWED)
+      return
+
+    state = self.hass.states.get(entity_id)
+    attributes = state.attributes if state is not None else {}
+    guard = self._code_guard()
+    try:
+      service, service_data = plan_access_call(
+        domain, command,
+        state.state if state is not None else None,
+        attributes,
+        has_default_code=self._has_default_code(entity_id, attributes),
+        allowed_without_code=entity_id in self.open_without_code,
+      )
+    except AccessError as err:
+      blocked = guard.retry_after(entity_id)
+      if err.status == STATUS_CODE_REQUIRED and blocked:
+        await answer(STATUS_LOCKED_OUT, blocked)
+      else:
+        await answer(err.status)
+      return
+    # Only commands carrying a code pass the guard: one at a time, at most
+    # ten per minute, and none while wrong codes keep it locked.
+    with_code = "code" in service_data
+
+    def lockout_started(seconds: int) -> None:
+      if not seconds:
+        return
+      _LOGGER.warning(
+        "HomeTiles code entry for %s on %s blocked for %d s after repeated wrong codes",
+        entity_id, self.base_topic, seconds,
+      )
+      self._notify_code_lockout(entity_id, seconds)
+
+    if with_code:
+      refused, blocked = guard.admit(entity_id)
+      if refused:
+        await answer(refused, blocked)
+        return
+      # A device with codes in the Bridge options gets only those: many
+      # devices ignore a wrong code without an error, Home Assistant answers
+      # ok, and neither "wrong code" nor the lockout could reach the panel.
+      known = self.access_codes.get(entity_id)
+      if known and not access_code_matches(service_data.get("code"), known):
+        service_data = {}
+        lockout_started(guard.finish(entity_id, STATUS_WRONG_CODE))
+        _LOGGER.debug("HomeTiles %s %s for %s: wrong code (Bridge)", leaf, command["action"], entity_id)
+        await answer(STATUS_WRONG_CODE, guard.retry_after(entity_id))
+        return
+
+    def outcome(task: asyncio.Future) -> str:
+      if task.cancelled():
+        return STATUS_FAILED
+      error = task.exception()
+      return STATUS_OK if error is None else classify_service_error(error)
+
+    def finished(task: asyncio.Future) -> None:
+      # Runs once per call, also after "pending" or a cancelled handler.
+      status = outcome(task)
+      if not with_code:
+        return
+      lockout_started(guard.finish(entity_id, status))
+
+    task = self.hass.async_create_task(self._async_call_access_service(
+      domain, service, {"entity_id": entity_id, **service_data}, entity_id,
+    ))
+    service_data = {}
+    task.add_done_callback(finished)
+    done, _pending = await asyncio.wait({task}, timeout=ACCESS_SERVICE_TIMEOUT_S)
+    if not done:
+      status = STATUS_PENDING
+    else:
+      status = outcome(task)
+      if status == STATUS_FAILED:
+        # Only the exception type: HA messages may quote the command.
+        _LOGGER.warning(
+          "HomeTiles %s %s for %s failed (%s)", leaf, command["action"], entity_id,
+          "cancelled" if task.cancelled() else type(task.exception()).__name__,
+        )
+    retry_after = guard.retry_after(entity_id) if status == STATUS_WRONG_CODE else 0
+    _LOGGER.debug("HomeTiles %s %s for %s: %s", leaf, command["action"], entity_id, status)
+    await answer(status, retry_after)
+
+  async def _async_call_access_service(
+    self, domain: str, service: str, data: Dict[str, Any], entity_id: str,
+  ) -> None:
+    """Run a Lock or Alarm service; for an Alarmo panel also wait for its verdict.
+
+    Alarmo reports a wrong code with an event instead of an error, right
+    after its service returns; without waiting for it the panel saw ok and
+    neither "wrong code" nor the lockout. Other integrations are unchanged.
+    """
+    registry_entry = er.async_get(self.hass).async_get(entity_id)
+    if getattr(registry_entry, "platform", None) != ALARMO_PLATFORM:
+      await self.hass.services.async_call(domain, service, data, blocking=True)
+      return
+    verdict: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    @callback
+    def heard(event: Any) -> None:
+      event_data = event.data or {}
+      if verdict.done() or event_data.get("entity_id") != entity_id:
+        return
+      verdict.set_result(
+        "success" if event.event_type == ALARMO_EVENT_SUCCESS else str(event_data.get("reason") or "")
+      )
+
+    unsubscribes = [
+      self.hass.bus.async_listen(name, heard) for name in (ALARMO_EVENT_SUCCESS, ALARMO_EVENT_FAILED)
+    ]
+    try:
+      await self.hass.services.async_call(domain, service, data, blocking=True)
+      try:
+        reason = await asyncio.wait_for(verdict, ALARMO_EVENT_WAIT_S)
+      except asyncio.TimeoutError:
+        return
+    finally:
+      for unsubscribe in unsubscribes:
+        unsubscribe()
+    if reason != "success":
+      raise AlarmoRejected(reason)
+
+  async def _async_handle_fan_command(self, msg: Any) -> None:
+    """Execute Fan tile commands; only features the entity supports."""
+    if getattr(msg, "retain", False):
+      return
+    command = parse_fan_command(msg.payload)
+    if command is None:
+      if self._secure_log_due("fan_malformed"):
+        _LOGGER.warning("Unhandled fan command from HomeTiles (malformed)")
+      return
+    raw_entity = command.get("entity_id")
+    entity_id = self._resolve_target_entity(
+      str(raw_entity).strip() if raw_entity is not None else None, self.fans,
+    )
+    if not entity_id or entity_domain(entity_id) != FAN_DOMAIN:
+      _LOGGER.warning("Unhandled fan command from HomeTiles (unknown entity): %s", raw_entity)
+      return
+    state = self.hass.states.get(entity_id)
+    call = build_fan_service_call(
+      command,
+      state.state if state is not None else None,
+      state.attributes if state is not None else {},
+    )
+    if call is None:
+      _LOGGER.debug("Ignoring unsupported or unavailable HomeTiles fan command for %s", entity_id)
+      return
+    service, service_data = call
+    await self.hass.services.async_call(
+      FAN_DOMAIN, service, {"entity_id": entity_id, **service_data}, blocking=False,
+    )
 
   async def _async_handle_value_command(self, msg):
     if getattr(msg, "retain", False) or len(msg.payload) > 2048:
@@ -1687,6 +2238,7 @@ class Tab5Bridge:
   ) -> str:
     if entity_id.startswith("media_player."):
       payload = _extract_media_player_payload(state, self.hass)
+      self._gate_media_artwork(entity_id, payload)
       if include_media_cover:
         await self._async_attach_media_cover_data(entity_id, payload)
       payload_text = json.dumps(payload, default=str)
@@ -1699,6 +2251,27 @@ class Tab5Bridge:
         )
       return payload_text
     return self._build_state_payload(entity_id, state)
+
+  def _gate_media_artwork(self, entity_id: str, payload: Dict[str, Any]) -> None:
+    """Clear the panel cover only after the player stayed without artwork."""
+    due_in = self._media_artwork_gate.apply(entity_id, payload, monotonic())
+    if due_in is None:
+      unsub = self._media_artwork_timers.pop(entity_id, None)
+      if unsub:
+        unsub()
+      return
+    if entity_id in self._media_artwork_timers:
+      return
+
+    @callback
+    def _republish(_now) -> None:
+      self._media_artwork_timers.pop(entity_id, None)
+      state = self.hass.states.get(entity_id)
+      if state is not None:
+        self.hass.async_create_task(self._async_publish_entity_state(entity_id, state))
+
+    # Without a new state change nothing would publish the cleared cover.
+    self._media_artwork_timers[entity_id] = async_call_later(self.hass, due_in + 0.05, _republish)
 
   def _owns_state_publish(self, entity_id: str) -> bool:
     """Return True if this entry is responsible for publishing entity_id.
@@ -1726,6 +2299,8 @@ class Tab5Bridge:
     topic = self._ha_topic_for_entity(entity_id, "state")
     if entity_id in self.numbers + self.selects + self.datetimes:
       await self._async_publish_editable_state(entity_id, state)
+    if entity_id in getattr(self, "locks", []) + getattr(self, "alarm_panels", []) + getattr(self, "fans", []):
+      await self._async_publish_detail_state(entity_id, state)
 
     if entity_id.startswith("media_player."):
       generation = self._media_publish_generation.get(entity_id, 0) + 1
@@ -1974,6 +2549,276 @@ class Tab5Bridge:
       len(cover_payload["entity_picture_data"]),
     )
 
+
+  async def _async_send_start_rekey(self, _now: Any = None) -> None:
+    """Ask the panel for a new session once the subscription is active."""
+    self._unsub_start_rekey = None
+    channel = self._command_channel
+    if channel is None or channel.session is not None:
+      return
+    rekey = channel.rekey(force=True)
+    if rekey:
+      await mqtt.async_publish(self.hass, rekey[0], rekey[1], qos=0, retain=False)
+      _LOGGER.debug("HomeTiles encrypted rekey sent to %s", self.base_topic)
+
+  def _command_handlers(self) -> Dict[str, Any]:
+    """Command leaf -> handler, shared by plain and sealed commands."""
+    return {
+      "scene": self._async_handle_scene_command,
+      "light": self._async_handle_light_command,
+      "switch": self._async_handle_switch_command,
+      "value": self._async_handle_value_command,
+      "media": self._async_handle_media_command,
+      "climate": self._async_handle_climate_command,
+      "cover": self._async_handle_cover_command,
+      "camera": self._async_handle_camera_command,
+      "fan": self._async_handle_fan_command,
+      "lock": self._async_handle_lock_command,
+      "alarm": self._async_handle_alarm_command,
+    }
+
+  def _secure_log_due(self, reason: str, interval: float = 60.0) -> bool:
+    now = monotonic()
+    last = self._secure_log_at.get(reason)
+    if last is not None and now - last < interval:
+      return False
+    self._secure_log_at[reason] = now
+    return True
+
+  async def _async_handle_secure_panel_message(self, msg: ReceiveMessage) -> None:
+    """Open a sealed panel message and run the command it carries."""
+    channel = self._command_channel
+    if channel is None or getattr(msg, "retain", False):
+      return
+    previous_session = channel.session
+    action, value = channel.handle_panel_message(msg.payload)
+    if action == "reply":
+      topic, payload = value
+      await mqtt.async_publish(self.hass, topic, payload, qos=0, retain=False)
+      # A hello gets a new session; a command for an unknown session a rekey.
+      new_session = channel.session != previous_session
+      _LOGGER.debug(
+        "HomeTiles encrypted %s sent to %s",
+        "session" if new_session else "rekey", self.base_topic,
+      )
+      if channel.removing and new_session:
+        unpair = channel.seal_unpair()
+        if unpair:
+          await mqtt.async_publish(self.hass, unpair[0], unpair[1], qos=0, retain=False)
+          _LOGGER.info("HomeTiles asked panel %s to turn encryption off", self.base_topic)
+      return
+    if action == "unpair":
+      if not channel.removing:
+        _LOGGER.warning(
+          "HomeTiles panel %s turned encryption off; its unencrypted commands are accepted again",
+          self.base_topic,
+        )
+        self._notify_pairing(
+          f"Encryption was turned off on the display ({self.entry.title}). "
+          "The Bridge accepts its unencrypted commands again."
+        )
+      self._drop_pairing()
+      return
+    if action != "command":
+      if value in ("rejected", "other_key"):
+        # Wrong code on one side, or somebody else publishing on this topic.
+        if self._secure_log_due(value):
+          _LOGGER.warning(
+            "HomeTiles encrypted command for %s ignored (%s)", self.base_topic,
+            "authentication failed" if value == "rejected" else "other pairing code",
+          )
+      elif self._secure_log_due(str(value), 10.0):
+        _LOGGER.debug("HomeTiles encrypted message for %s ignored (%s)", self.base_topic, value)
+      return
+    leaf, body = value
+    handler = self._command_handlers().get(leaf)
+    try:
+      text = body.decode("utf-8")
+    except UnicodeDecodeError:
+      return
+    if handler is not None:
+      await handler(_OpenedCommand(f"{self.base_topic}/cmnd/{leaf}", text))
+
+  async def _async_handle_secure_status(self, msg: ReceiveMessage) -> None:
+    """Track the panel's retained pairing status (it grants nothing)."""
+    self.command_status = parse_command_status(msg.payload)
+    channel = self._command_channel
+    state = self.command_status["state"]
+    kid = self.command_status["kid"]
+    if channel is None:
+      return
+    if channel.removing:
+      # The panel shows no pairing, or another one: nothing left to turn off.
+      if state == "off" or (kid is not None and kid != channel.keys.key_id):
+        _LOGGER.info("HomeTiles panel %s turned encryption off", self.base_topic)
+        self._drop_pairing()
+        return
+    elif state == "off":
+      # Anyone on the broker can publish this status, so it removes nothing.
+      if self._secure_log_due("status_off", 3600.0):
+        _LOGGER.warning(
+          "HomeTiles panel %s reports encryption off, but the Bridge still has its key "
+          "and ignores its unencrypted commands; turn encryption off under Configure > Security",
+          self.base_topic,
+        )
+        self._notify_pairing(
+          f"The display ({self.entry.title}) reports that encryption is off, but the Bridge still "
+          "has its key and ignores its unencrypted commands. If you turned encryption off "
+          "on the display, turn it off under Configure > Security as well."
+        )
+      return
+    if kid is None:
+      return
+    if kid != channel.keys.key_id:
+      if self._secure_log_due("status_kid"):
+        _LOGGER.warning(
+          "HomeTiles panel %s uses another key; turn encryption off under "
+          "Configure > Security and set it up on the display again",
+          self.base_topic,
+        )
+      return
+    if channel.session is None:
+      rekey = channel.rekey()
+      if rekey:
+        await mqtt.async_publish(self.hass, rekey[0], rekey[1], qos=0, retain=False)
+        _LOGGER.debug("HomeTiles encrypted rekey sent to %s", self.base_topic)
+
+  def _drop_pairing(self) -> None:
+    """Forget the pairing key; the update listener reloads the entry unpaired."""
+    self._command_channel = None
+    self.hass.config_entries.async_update_entry(
+      self.entry,
+      data=without_pairing(self.entry.data),
+      options=without_pairing(self.entry.options),
+    )
+
+  def _notify_pairing(self, message: str) -> None:
+    persistent_notification.async_create(
+      self.hass, message, title="HomeTiles Bridge",
+      notification_id=f"{DOMAIN}_{self.entry.entry_id}_pairing",
+    )
+
+  async def _async_handle_pair_message(self, msg: ReceiveMessage) -> None:
+    """A pairing message from the panel ({base}/pair/panel)."""
+    if getattr(msg, "retain", False):
+      return
+    # A removal in progress counts as paired: the panel turns it off first.
+    events = self._pairing.handle(msg.payload, paired=self._command_channel is not None)
+    await self._async_apply_pairing_events(events)
+
+  def pairing_number(self, attempt_id: Optional[str]) -> Optional[str]:
+    """The number of a pairing attempt the user can still answer ("061 806")."""
+    return self._pairing.number(attempt_id)
+
+  async def async_answer_pairing(
+    self, attempt_id: Optional[str], accept: bool, flow_id: Optional[str] = None,
+  ) -> str:
+    """The user's answer on the pairing card (config_flow.py); the card stays open."""
+    outcome, events = self._pairing.answer(attempt_id, accept)
+    self._answering_flow_id = flow_id
+    try:
+      await self._async_apply_pairing_events(events)
+    finally:
+      self._answering_flow_id = None
+    return outcome
+
+  async def _async_pairing_tick(self, _now: Any = None) -> None:
+    self._unsub_pairing_tick = None
+    await self._async_apply_pairing_events(self._pairing.tick())
+
+  def _schedule_pairing_tick(self) -> None:
+    if self._pairing.active and self._unsub_pairing_tick is None:
+      self._unsub_pairing_tick = async_call_later(self.hass, PAIRING_TICK_S, self._async_pairing_tick)
+    elif not self._pairing.active and self._unsub_pairing_tick is not None:
+      self._unsub_pairing_tick()
+      self._unsub_pairing_tick = None
+
+  async def _async_apply_pairing_events(self, events: List[Tuple[str, Any]]) -> None:
+    for event, value in events:
+      if event == "send":
+        await mqtt.async_publish(self.hass, self._pairing.bridge_topic, value, qos=0, retain=False)
+      elif event == "prompt":
+        _LOGGER.info(
+          "HomeTiles panel %s asks to set up encryption; compare the number in Home Assistant", self.base_topic,
+        )
+        self._show_pairing_card(value[0])
+      elif event == "closed":
+        _LOGGER.info("HomeTiles encryption setup of %s ended (%s)", self.base_topic, value)
+        self._close_pairing_card()
+      elif event == "refused":
+        if value == "paired" and self._secure_log_due("pair_paired"):
+          _LOGGER.warning(
+            "HomeTiles panel %s asks to set up encryption, but the Bridge still has its key; "
+            "turn encryption off under Configure > Security first",
+            self.base_topic,
+          )
+        elif self._secure_log_due(f"pair_{value}", 10.0):
+          _LOGGER.debug("HomeTiles encryption setup of %s refused (%s)", self.base_topic, value)
+      elif event == "paired":
+        self._close_pairing_card()
+        self._store_pairing(value)
+    self._schedule_pairing_tick()
+
+  def _show_pairing_card(self, attempt_id: str) -> None:
+    """A card under Discovered; config_flow.async_step_pairing_confirm shows the number."""
+    discovery_flow.async_create_flow(
+      self.hass,
+      DOMAIN,
+      context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+      data={DISCOVERY_PAIRING_ENTRY: self.entry.entry_id, DISCOVERY_PAIRING_ATTEMPT: attempt_id},
+    )
+
+  def _close_pairing_card(self) -> None:
+    flows = self.hass.config_entries.flow
+    unique_id = f"{PAIRING_UNIQUE_ID_PREFIX}{self.entry.entry_id}"
+    for flow in flows.async_progress_by_handler(DOMAIN, match_context={"unique_id": unique_id}):
+      # The card that is answering closes itself with its result.
+      if flow["flow_id"] != self._answering_flow_id:
+        flows.async_abort(flow["flow_id"])
+
+  def _store_pairing(self, pairing_key: bytes) -> None:
+    """Keep the pairing key; the update listener reloads the entry paired."""
+    _LOGGER.info("HomeTiles encryption set up for %s (key id %s)", self.base_topic, CommandKeys(pairing_key).key_id)
+    self.hass.config_entries.async_update_entry(
+      self.entry,
+      data=with_pairing_key(self.entry.data, pairing_key),
+      options=without_pairing(self.entry.options),
+    )
+
+  async def _async_publish_sealed_data(self, kind: str, text: str) -> bool:
+    """Send a stream-token message to a paired panel; never unencrypted."""
+    channel = self._command_channel
+    sealed = channel.seal_data(kind, text.encode("utf-8"))
+    if sealed is None:
+      rekey = channel.rekey()
+      if rekey:
+        await mqtt.async_publish(self.hass, rekey[0], rekey[1], qos=0, retain=False)
+      if self._secure_log_due(f"no_session_{kind}", 10.0):
+        _LOGGER.debug("HomeTiles %s message for %s dropped: no encrypted session", kind, self.base_topic)
+      return False
+    await mqtt.async_publish(self.hass, sealed[0], sealed[1], qos=0, retain=False)
+    return True
+
+  async def _async_publish_camera_status(self, payload: Dict[str, Any]) -> None:
+    """Answer a camera command; the answer can carry a stream token."""
+    text = json.dumps(payload)
+    channel = self._command_channel
+    if channel is not None and not channel.removing:
+      await self._async_publish_sealed_data("camera", text)
+      return
+    await mqtt.async_publish(
+      self.hass, f"{self.base_topic}/stat/camera", text, qos=0, retain=False,
+    )
+
+  async def async_publish_local_camera_command(self, text: str) -> None:
+    """Snapshot, stream and pause requests for the panel's own camera."""
+    channel = self._command_channel
+    if channel is not None and not channel.removing:
+      await self._async_publish_sealed_data("local_camera", text)
+      return
+    await mqtt.async_publish(
+      self.hass, local_camera_command_topic(self.base_topic), text, qos=0, retain=False,
+    )
 
   async def _async_handle_connected(self, msg: ReceiveMessage) -> None:
     """Handle Tab5 connection event."""
@@ -2350,6 +3195,27 @@ class Tab5Bridge:
       retain=False,
     )
 
+  async def _async_on_history_request(self, msg: ReceiveMessage) -> None:
+    """Bound history requests before they reach the Recorder."""
+    # The panel never retains a request; a retained one would be answered
+    # again after every Home Assistant restart.
+    if getattr(msg, "retain", False):
+      return
+    if len(msg.payload or "") > HISTORY_REQUEST_MAX_BYTES:
+      return
+    # Every graph tile of a view asks at once; extra requests wait in line.
+    if not await self._history_gate.acquire():
+      if self._secure_log_due("history_limited", 60.0):
+        _LOGGER.warning(
+          "Tab5 history requests for %s are arriving too fast; extra requests are ignored",
+          self.device_id or self.base_topic,
+        )
+      return
+    try:
+      await self._async_handle_history_request(msg)
+    finally:
+      self._history_gate.release()
+
   async def _async_handle_history_request(self, msg: ReceiveMessage) -> None:
     """Handle history requests from the Tab5 popup."""
     if not self.history_response_topic:
@@ -2404,6 +3270,7 @@ class Tab5Bridge:
 
     state = self.hass.states.get(entity_id)
     current_numeric = _coerce_float(state.state) if state else None
+    state_unit = state.attributes.get("unit_of_measurement") if state else None
 
     def _empty_values_with_current() -> List[Optional[float]]:
       values: List[Optional[float]] = [None] * points
@@ -2412,85 +3279,32 @@ class Tab5Bridge:
       return values
 
     def _fetch_history_values() -> List[Optional[float]]:
-      if points <= 0 or (state_changes_during_period is None and get_significant_states is None):
+      if points <= 0 or (state_changes_during_period is None and get_last_state_changes is None):
         return _empty_values_with_current()
-
-      history = None
-      if state_changes_during_period is not None:
-        try:
-          history = state_changes_during_period(
-            self.hass,
-            start,
-            end,
-            entity_id,
-            include_start_time_state=True,
-            minimal_response=True,
-            no_attributes=True,
-          )
-        except TypeError:
-          history = state_changes_during_period(self.hass, start, end, entity_id)
-      elif get_significant_states is not None:
-        try:
-          history = get_significant_states(
-            self.hass,
-            start,
-            end,
-            [entity_id],
-            include_start_time_state=True,
-            minimal_response=True,
-            no_attributes=True,
-          )
-        except TypeError:
-          history = get_significant_states(self.hass, start, end, [entity_id])
-
-      states = history.get(entity_id, []) if history else []
-      if not states:
-        return _empty_values_with_current()
-
-      bucket_seconds = max(period_minutes, 1) * 60
-      sums = [0.0] * points
-      counts = [0] * points
-      mins: List[Optional[float]] = [None] * points
-      maxs: List[Optional[float]] = [None] * points
-      lasts: List[Optional[float]] = [None] * points
-
-      for state in states:
-        state_time = getattr(state, "last_changed", None) or getattr(state, "last_updated", None)
-        if state_time is None:
-          continue
-        idx = int((state_time - start).total_seconds() / bucket_seconds)
-        if idx < 0:
-          continue
-        if idx >= points:
-          idx = points - 1
-        value = _coerce_float(getattr(state, "state", None))
-        if value is None:
-          continue
-        counts[idx] += 1
-        sums[idx] += value
-        if mins[idx] is None or value < mins[idx]:
-          mins[idx] = value
-        if maxs[idx] is None or value > maxs[idx]:
-          maxs[idx] = value
-        lasts[idx] = value
-
-      values: List[Optional[float]] = []
-      for idx in range(points):
-        value: Optional[float] = None
-        if counts[idx] > 0:
-          if stat == "min":
-            value = mins[idx]
-          elif stat == "max":
-            value = maxs[idx]
-          elif stat == "last":
-            value = lasts[idx]
-          else:
-            value = sums[idx] / counts[idx]
-        values.append(round(value, 3) if value is not None else None)
-
+      # Statistics when the sensor has them, otherwise paged state rows with
+      # a cap (numeric_history.py): a busy sensor cannot make one request
+      # load a week of raw rows at once.
+      values, rows_read, complete = fetch_numeric_history_values(
+        self.hass,
+        entity_id,
+        start,
+        end,
+        points,
+        period_minutes,
+        stat,
+        state_changes_during_period=state_changes_during_period,
+        get_last_state_changes=get_last_state_changes,
+        statistics_during_period=statistics_during_period,
+        get_metadata=get_statistics_metadata,
+        get_display_unit=get_statistics_display_unit,
+        state_unit=state_unit,
+      )
+      if not complete:
+        _LOGGER.debug(
+          "Tab5 history for %s limited to the newest %d rows", entity_id, rows_read
+        )
       if not any(v is not None for v in values):
         return _empty_values_with_current()
-
       return values
 
     values = await get_instance(self.hass).async_add_executor_job(_fetch_history_values)
@@ -3264,23 +4078,16 @@ class Tab5Bridge:
     raw_entity = parsed.get("entity_id") or parsed.get("entity")
     requested_entity = str(raw_entity).strip() if raw_entity is not None else None
     entity_id = self._resolve_target_entity(requested_entity, self.cameras)
-    status_topic = f"{self.base_topic}/stat/camera"
     manager = self.hass.data.get(DOMAIN, {}).get("camera_stream_manager")
 
     if command in ("close", "stop"):
       if manager and self.device_id:
         await manager.async_stop_device(self.device_id)
-      await mqtt.async_publish(
-        self.hass,
-        status_topic,
-        json.dumps({
-          "status": "stopped",
-          "entity_id": entity_id or requested_entity or "",
-          "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
-        }),
-        qos=0,
-        retain=False,
-      )
+      await self._async_publish_camera_status({
+        "status": "stopped",
+        "entity_id": entity_id or requested_entity or "",
+        "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
+      })
       return
 
     if command == "open" and entity_id and self._is_local_camera_self_loop(entity_id):
@@ -3288,33 +4095,21 @@ class Tab5Bridge:
         "HomeTiles camera stream refused for %s: it is this panel's own camera",
         entity_id,
       )
-      await mqtt.async_publish(
-        self.hass,
-        status_topic,
-        json.dumps({
-          "status": "error",
-          "entity_id": entity_id,
-          "error": "camera_self_loop",
-          "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
-        }),
-        qos=0,
-        retain=False,
-      )
+      await self._async_publish_camera_status({
+        "status": "error",
+        "entity_id": entity_id,
+        "error": "camera_self_loop",
+        "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
+      })
       return
 
     if command != "open" or not entity_id or manager is None or not self.device_id:
-      await mqtt.async_publish(
-        self.hass,
-        status_topic,
-        json.dumps({
-          "status": "error",
-          "entity_id": requested_entity or "",
-          "error": "unknown_camera",
-          "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
-        }),
-        qos=0,
-        retain=False,
-      )
+      await self._async_publish_camera_status({
+        "status": "error",
+        "entity_id": requested_entity or "",
+        "error": "unknown_camera",
+        "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
+      })
       return
 
     try:
@@ -3330,17 +4125,11 @@ class Tab5Bridge:
 
       async def _async_notify_panel_end(stopped_entity: str = entity_id) -> None:
         # The camera's panel ended the live view: this popup shows "stopped".
-        await mqtt.async_publish(
-          self.hass,
-          status_topic,
-          json.dumps({
-            "status": "stopped",
-            "entity_id": stopped_entity,
-            "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
-          }),
-          qos=0,
-          retain=False,
-        )
+        await self._async_publish_camera_status({
+          "status": "stopped",
+          "entity_id": stopped_entity,
+          "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
+        })
 
       session.on_panel_end = _async_notify_panel_end
       _LOGGER.info(
@@ -3395,13 +4184,7 @@ class Tab5Bridge:
         "protocol_version": CAMERA_BRIDGE_PROTOCOL_VERSION,
       }
 
-    await mqtt.async_publish(
-      self.hass,
-      status_topic,
-      json.dumps(response_payload),
-      qos=0,
-      retain=False,
-    )
+    await self._async_publish_camera_status(response_payload)
 
   async def _async_handle_media_command(self, msg: ReceiveMessage) -> None:
     """Execute media player commands originating from the Tab5."""
@@ -3521,6 +4304,8 @@ class Tab5Bridge:
         )
       elif entity_id in self.switches:
         self.hass.async_create_task(self._async_publish_switch_absent_state(entity_id))
+      if entity_id in getattr(self, "locks", []) + getattr(self, "alarm_panels", []) + getattr(self, "fans", []):
+        self.hass.async_create_task(self._async_publish_detail_state(entity_id, None))
       return
 
     self.hass.async_create_task(self._async_publish_entity_state(entity_id, new_state))
@@ -3951,6 +4736,11 @@ class Tab5Bridge:
       if prepared_hourly:
         payload["forecast_hourly"] = prepared_hourly
 
+    # The panel shows the moon variants of the icons between sunset and sunrise.
+    sun = _weather_sun(self.hass, payload)
+    if sun:
+      payload["sun"] = sun
+
     return json.dumps(payload)
 
   def _ha_topic_for_entity(self, entity_id: str, suffix: str) -> str:
@@ -4292,6 +5082,28 @@ class Tab5Bridge:
     return entries
 
 
+def _access_codes_of(data: Dict[str, Any]) -> Dict[str, List[str]]:
+  """CONF_ACCESS_CODES of one config entry: entity_id -> codes.
+
+  Entries a newer or edited configuration made unusable are skipped, so a
+  broken entry falls back to the check of Home Assistant and the device.
+  """
+  result: Dict[str, List[str]] = {}
+  raw = data.get(CONF_ACCESS_CODES)
+  if not isinstance(raw, dict):
+    return result
+  for entity_id, text in raw.items():
+    if not isinstance(entity_id, str):
+      continue
+    try:
+      codes = parse_access_codes(text)
+    except ValueError:
+      continue
+    if codes:
+      result[entity_id] = codes
+  return result
+
+
 def _unique_entities(entities: List[str]) -> List[str]:
   seen = set()
   result: List[str] = []
@@ -4583,6 +5395,29 @@ def _compact_hourly_forecast(hourly_forecast: List[Dict[str, Any]]) -> List[Dict
     if out:
       compact.append(out)
   return compact
+
+
+def _weather_sun(hass: HomeAssistant, payload: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+  """Local sun times from today through the last forecast day (sun_times.py)."""
+  latitude = hass.config.latitude
+  longitude = hass.config.longitude
+  if latitude is None or longitude is None or (latitude == 0 and longitude == 0):
+    return None  # Home Assistant has no home location.
+  forecast_days = [entry.get("date_local") for entry in payload.get("forecast") or []
+                   if isinstance(entry, dict)]
+  forecast_days += [entry.get("d") for entry in payload.get("forecast_hourly") or []
+                    if isinstance(entry, dict)]
+
+  def event(kind: str, day: date) -> Optional[datetime]:
+    # Works from the configured location, also without the sun integration.
+    moment = get_astral_event_date(hass, kind, day)
+    return dt_util.as_local(moment) if moment is not None else None
+
+  try:
+    return sun_entries(sun_days(dt_util.now().date(), forecast_days), event, latitude)
+  except Exception:
+    _LOGGER.debug("HomeTiles Bridge could not compute the sun times", exc_info=True)
+    return None
 
 
 def _try_parse_json(payload: str) -> Any:
@@ -5043,7 +5878,13 @@ def _extract_weather_payload(state: State, hass: Optional[HomeAssistant] = None)
   return payload
 
 
-async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, Any]) -> None:
+async def _async_process_bridge_config(
+  hass: HomeAssistant,
+  payload: Dict[str, Any],
+  *,
+  topic: Optional[str] = None,
+  raw_payload: Any = None,
+) -> None:
   try:
     data = _payload_to_entry_data(payload)
   except ValueError as err:
@@ -5051,6 +5892,14 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     return
 
   device_id = data.get(CONF_DEVICE_ID)
+  if topic is not None and not announcement_matches_topic(topic, device_id):
+    # Every panel announces under its own id; anything else is a forgery or
+    # a stray message and must not reach another panel's entry.
+    if _announcement_log_due(hass, "topic"):
+      _LOGGER.warning(
+        "HomeTiles Bridge ignored an announcement for another device id on %s", topic,
+      )
+    return
   entry = _find_entry_by_device_id(hass, device_id)
 
   if entry and entry.source == config_entries.SOURCE_IGNORE:
@@ -5058,6 +5907,8 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     return
 
   if entry:
+    if not _announcement_trusted(hass, entry, data, topic, raw_payload):
+      return
     runtime_sensor_ids = _runtime_managed_sensor_entity_ids(hass, entry, data)
     data[CONF_SENSORS] = filter_runtime_sensor_entities(
       data.get(CONF_SENSORS, []), runtime_sensor_ids
@@ -5084,12 +5935,13 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     # haben kann. Ohne dieses Nachtragen wuerde genau dieser Fall die bereits
     # gemachte Konfiguration beim ersten echten Connect stillschweigend
     # verwerfen, weil sonst nur der Erstell-Pfad sie uebernimmt.
+    access_keys = (CONF_LOCKS, CONF_ALARM_PANELS) if entry_pairing_key(entry) else ()
     for key in (
       CONF_SENSORS, CONF_BINARY_SENSORS, CONF_WEATHERS, CONF_LIGHTS, CONF_SWITCHES,
       CONF_MEDIA_PLAYERS, CONF_CLIMATES, CONF_COVERS, CONF_CAMERAS,
-      CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES,
+      CONF_NUMBERS, CONF_SELECTS, CONF_DATETIMES, CONF_FANS,
       CONF_SCENE_MAP,
-    ):
+    ) + access_keys:
       if should_import_feedback_selection(
         existing, cleaned_options, key, data.get(key)
       ):
@@ -5131,31 +5983,31 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     )
     return
   if fallback:
-    new_data = dict(fallback.data)
-    changed = False
-    if device_id and new_data.get(CONF_DEVICE_ID) != device_id:
-      new_data[CONF_DEVICE_ID] = device_id
-      changed = True
-    if CONF_LOCAL_IO in data and new_data.get(CONF_LOCAL_IO) != data[CONF_LOCAL_IO]:
-      new_data[CONF_LOCAL_IO] = data[CONF_LOCAL_IO]
-      changed = True
-    if CAPABILITIES in data and new_data.get(CAPABILITIES) != data[CAPABILITIES]:
-      new_data[CAPABILITIES] = data[CAPABILITIES]
-      changed = True
-    if not changed:
+    if entry_pairing_key(fallback) and not _announcement_trusted(
+      hass, fallback, data, topic, raw_payload,
+    ):
       return
+    # Any MQTT client can announce this base topic, so binding a panel to an
+    # existing entry waits for the user (config_flow adopt_confirm step).
+    data[DISCOVERY_ADOPT_ENTRY] = fallback.entry_id
 
-    _LOGGER.info("HomeTiles Bridge adopted device %s into the existing entry", device_id)
-    hass.config_entries.async_update_entry(
-      fallback,
-      data=new_data,
-      title=_entry_title(new_data),
-      unique_id=device_id or fallback.unique_id,
-    )
-    await hass.config_entries.async_reload(fallback.entry_id)
+  domain_data = hass.data.setdefault(DOMAIN, {"entries": {}})
+  limiter = domain_data.get("_discovery_limiter")
+  if limiter is None:
+    limiter = domain_data["_discovery_limiter"] = DiscoveryLimiter(monotonic)
+  if not limiter.allow(device_id, _pending_discovery_flows(hass)):
+    # Bounded discovery cards: a flood of forged announcements cannot bury
+    # the user in setup cards.
+    if _announcement_log_due(hass, "discovery"):
+      _LOGGER.warning(
+        "HomeTiles Bridge ignored announcements from new panels: too many in a short time",
+      )
     return
 
   _LOGGER.info("HomeTiles Bridge discovered device %s; waiting for confirmation", device_id)
+  # A new panel is not paired yet, so it cannot add locks or alarm panels.
+  data.pop(CONF_LOCKS, None)
+  data.pop(CONF_ALARM_PANELS, None)
   data[CONF_SENSORS] = filter_runtime_sensor_entities(
     data.get(CONF_SENSORS, []),
     _runtime_managed_sensor_entity_ids(hass, None, data),
@@ -5167,6 +6019,83 @@ async def _async_process_bridge_config(hass: HomeAssistant, payload: Dict[str, A
     context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
     data=data,
   )
+
+
+def _announcement_log_due(hass: HomeAssistant, reason: str, interval: float = 300.0) -> bool:
+  """Rate-limit warnings about announcements that anyone on MQTT can send."""
+  seen = hass.data.setdefault(DOMAIN, {"entries": {}}).setdefault("_announcement_log", {})
+  now = monotonic()
+  last = seen.get(reason)
+  if last is not None and now - last < interval:
+    return False
+  seen[reason] = now
+  return True
+
+
+def _announcement_trusted(
+  hass: HomeAssistant,
+  entry: ConfigEntry,
+  data: Dict[str, Any],
+  topic: Optional[str],
+  raw_payload: Any,
+) -> bool:
+  """May this announcement update the entry of the panel it names?"""
+  pairing_key = entry_pairing_key(entry)
+  if pairing_key:
+    # A paired panel signs its announcement with its pairing key.
+    signature = check_signature(CommandKeys(pairing_key).announce, topic or "", raw_payload)
+    if signature != SIGNATURE_VALID:
+      if _announcement_log_due(hass, f"signature_{entry.entry_id}"):
+        _LOGGER.warning(
+          "HomeTiles Bridge ignored an unsigned or wrongly signed announcement for %s; "
+          "if the display lost its key, turn encryption off under Configure > Security "
+          "and set it up again",
+          entry.title,
+        )
+      return False
+  stored = dict(entry.data or {})
+  stored.update(entry.options or {})
+  entry_base = _normalise_topic(stored.get(CONF_BASE_TOPIC), DEFAULT_BASE)
+  if data.get(CONF_BASE_TOPIC) != entry_base:
+    # The entry keeps listening on its own base topic; an announcement with
+    # another one cannot change its entities or selections.
+    if _announcement_log_due(hass, f"base_{entry.entry_id}"):
+      _LOGGER.warning(
+        "HomeTiles Bridge ignored an announcement for %s with base topic %s instead of %s",
+        entry.title, data.get(CONF_BASE_TOPIC), entry_base,
+      )
+    return False
+  return True
+
+
+def _pending_discovery_flows(hass: HomeAssistant) -> int:
+  """Discovery cards of this integration that still wait for the user."""
+  flow_manager = getattr(hass.config_entries, "flow", None)
+  progress = getattr(flow_manager, "async_progress_by_handler", None)
+  if progress is None:
+    return 0
+  source = config_entries.SOURCE_INTEGRATION_DISCOVERY
+  try:
+    flows = progress(DOMAIN, match_context={"source": source})
+  except TypeError:
+    flows = [
+      flow for flow in progress(DOMAIN)
+      if (flow.get("context") or {}).get("source") == source
+    ]
+  # Pairing cards are limited by pairing.py, not by the panel announcements.
+  return len([
+    flow for flow in flows
+    if not str((flow.get("context") or {}).get("unique_id") or "").startswith(PAIRING_UNIQUE_ID_PREFIX)
+  ])
+
+
+def _panel_pairing(hass: HomeAssistant, entry_id: str, base_topic: str) -> PanelPairing:
+  """The pairing state of one entry; kept in hass.data across reloads."""
+  store = hass.data.setdefault(DOMAIN, {"entries": {}}).setdefault("_pairing", {})
+  pairing = store.get(entry_id)
+  if pairing is None or pairing.base_topic != base_topic:
+    pairing = store[entry_id] = PanelPairing(base_topic, clock=monotonic)
+  return pairing
 
 
 def _payload_to_entry_data(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -5205,6 +6134,10 @@ def _payload_to_entry_data(payload: Dict[str, Any]) -> Dict[str, Any]:
   switches = panel_entity_list(payload.get("switches"), CONF_SWITCHES)
   media_players = panel_entity_list(payload.get("media_players"), CONF_MEDIA_PLAYERS)
   climates = panel_entity_list(payload.get("climates"), CONF_CLIMATES)
+  fans = panel_entity_list(payload.get(CONF_FANS), CONF_FANS)
+  # Imported only from a paired panel (_async_process_bridge_config).
+  locks = panel_entity_list(payload.get(CONF_LOCKS), CONF_LOCKS)
+  alarm_panels = panel_entity_list(payload.get(CONF_ALARM_PANELS), CONF_ALARM_PANELS)
 
   covers_raw = payload.get("covers") or []
   if not isinstance(covers_raw, list):
@@ -5242,6 +6175,9 @@ def _payload_to_entry_data(payload: Dict[str, Any]) -> Dict[str, Any]:
     CONF_CLIMATES: climates,
     CONF_COVERS: covers,
     CONF_CAMERAS: cameras,
+    CONF_FANS: fans,
+    CONF_LOCKS: locks,
+    CONF_ALARM_PANELS: alarm_panels,
     CONF_SCENE_MAP: scene_map,
   }
   for key, domains in EDITABLE_LISTS.items():
